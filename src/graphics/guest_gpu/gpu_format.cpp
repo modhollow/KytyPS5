@@ -10,9 +10,9 @@ namespace {
 
 struct FormatInfo {
 	BufferFormat format;
-	uint32_t     bytes_per_element;
-	uint32_t     block_compressed_bytes_per_block;
-	uint32_t     render_target_bytes_per_element;
+	uint8_t      bytes_per_element;
+	uint8_t      block_compressed_bytes_per_block;
+	uint8_t      render_target_bytes_per_element;
 	bool         sampled_texture;
 	bool         uint_texture;
 	bool         sint_texture = false;
