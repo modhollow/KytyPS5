@@ -18,6 +18,8 @@
 #include <unistd.h>
 #endif
 
+#include "common/file.h"
+
 namespace Libs::Graphics::PipelineCacheFile {
 namespace {
 constexpr std::string_view Format = "KytyDriverCache1:";
@@ -112,6 +114,49 @@ std::filesystem::path Path(std::string_view title, const std::filesystem::path& 
 	return root / "driver-v1" / device / (std::string(title) + ".bin");
 }
 
+std::filesystem::path NativePath(const std::filesystem::path& logical) {
+#ifdef _WIN32
+	if (logical.empty()) return {};
+	const auto& spelling = logical.native();
+	// Namespace paths already specify their interpretation; retain them verbatim.
+	if (spelling.starts_with(L"\\\\?\\") || spelling.starts_with(L"\\\\.\\")) return logical;
+	std::error_code error;
+	auto            absolute = std::filesystem::absolute(logical, error);
+	if (error) return {};
+	absolute             = absolute.lexically_normal().make_preferred();
+	const auto& resolved = absolute.native();
+	if (resolved.starts_with(L"\\\\")) {
+		return std::filesystem::path(L"\\\\?\\UNC\\" + resolved.substr(2));
+	}
+	return std::filesystem::path(L"\\\\?\\" + resolved);
+#else
+	return logical;
+#endif
+}
+
+bool CreateDirectories(const std::filesystem::path& logical) {
+#ifdef _WIN32
+	auto current = NativePath(logical);
+	if (current.empty()) return false;
+	std::vector<std::filesystem::path> missing;
+	// Walk complete native parents instead of rebuilding a namespace root by components.
+	while (!Common::File::IsDirectoryExisting(current)) {
+		const auto parent = current.parent_path();
+		if (parent.empty() || parent == current) return false;
+		missing.push_back(current);
+		current = parent;
+	}
+	for (auto directory = missing.rbegin(); directory != missing.rend(); ++directory) {
+		if (!Common::File::CreateDirectory(*directory) &&
+		    !Common::File::IsDirectoryExisting(*directory))
+			return false;
+	}
+	return true;
+#else
+	return Common::File::CreateDirectories(logical);
+#endif
+}
+
 std::filesystem::path Temporary(const std::filesystem::path& destination) {
 	static std::atomic<uint64_t> sequence {0};
 	for (unsigned attempt = 0; attempt < 64; ++attempt) {
@@ -121,7 +166,9 @@ std::filesystem::path Temporary(const std::filesystem::path& destination) {
 		temporary += fmt::format(".tmp.{:016x}.{:016x}", stamp, sequence.fetch_add(1));
 		// Reserve in the destination directory without truncating another writer's file.
 #ifdef _WIN32
-		const auto file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+		const auto native = NativePath(temporary);
+		if (native.empty()) return {};
+		const auto file = CreateFileW(native.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
 		                              FILE_ATTRIBUTE_NORMAL, nullptr);
 		if (file != INVALID_HANDLE_VALUE) {
 			CloseHandle(file);
@@ -143,7 +190,10 @@ std::filesystem::path Temporary(const std::filesystem::path& destination) {
 
 bool Replace(const std::filesystem::path& temporary, const std::filesystem::path& destination) {
 #ifdef _WIN32
-	return MoveFileExW(temporary.c_str(), destination.c_str(),
+	const auto native_temporary   = NativePath(temporary);
+	const auto native_destination = NativePath(destination);
+	if (native_temporary.empty() || native_destination.empty()) return false;
+	return MoveFileExW(native_temporary.c_str(), native_destination.c_str(),
 	                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
 	std::error_code error;
@@ -157,7 +207,7 @@ std::string Compatibility(const Identity& identity) {
 }
 
 Decoded Read(const std::filesystem::path& path, const Identity& identity, size_t max_bytes) {
-	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	std::ifstream file(NativePath(path), std::ios::binary | std::ios::ate);
 	if (!file) return {{}, Error::Size};
 	const auto end = file.tellg();
 	if (end <= 0 || end > std::streamoff(max_bytes) || max_bytes > 2ull * MaxFileBytes)
@@ -173,9 +223,9 @@ bool Current(const std::filesystem::path& path, const Identity& identity,
              const std::filesystem::path& seeds) {
 	if (!seeds.empty()) {
 		std::error_code error;
-		const auto      written = std::filesystem::last_write_time(path, error);
+		const auto      written = std::filesystem::last_write_time(NativePath(path), error);
 		if (error) return false;
-		const auto seeded = std::filesystem::last_write_time(seeds, error);
+		const auto seeded = std::filesystem::last_write_time(NativePath(seeds), error);
 		if (error || written < seeded) return false;
 	}
 	const auto decoded = Read(path, identity);

@@ -44,6 +44,17 @@ param(
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
 	[switch]$InputsOnly,
+	# Every allowed CPU at full power (the processes still below normal priority), instead of the cores less one at
+	# reduced power.
+	[switch]$FullSpeed,
+	# Print the processes, threads and power the run would use (JSON) and exit; -LogicalCpus/-PhysicalCores stand
+	# in for this PC's (tests).
+	[switch]$PlanOnly,
+	[int]$LogicalCpus = 0,
+	[int]$PhysicalCores = 0,
+	# Only the first N shards of the seeds, and no merge after them (measuring the precompile: the static cache stays
+	# incomplete); 0: all.
+	[int]$ShardLimit = 0,
     [string]$CacheRoot = '',
 	[string]$Exe = $(if (Test-Path "$PSScriptRoot\kyty_shader_precompile.exe") { "$PSScriptRoot\kyty_shader_precompile.exe" } else { "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe" })
 )
@@ -51,6 +62,40 @@ $ErrorActionPreference = 'Stop'
 if (!$CacheRoot) { $CacheRoot = if ($env:KYTY_PIPELINE_CACHE_ROOT) { $env:KYTY_PIPELINE_CACHE_ROOT } else { Join-Path $PSScriptRoot '_PipelineCache' } }
 $CacheRoot = [IO.Path]::GetFullPath($CacheRoot)
 $env:KYTY_PIPELINE_CACHE_ROOT = $CacheRoot
+
+if ($Affinity -eq 0) {
+	$config = @("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |
+		Select-Object -First 1
+	foreach ($cpu in (Get-Content $config -Raw | ConvertFrom-Json).cpu_affinity) { $Affinity = $Affinity -bor ([int64]1 -shl [int]$cpu) }
+}
+if ($LogicalCpus -le 0) { $LogicalCpus = [Environment]::ProcessorCount }
+if ($PhysicalCores -le 0) { $PhysicalCores = [math]::Max(1, [int](Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum) }
+$all = if ($LogicalCpus -ge 64) { [int64]-1 } else { ([int64]1 -shl $LogicalCpus) - 1 }
+$mask = $Affinity -band $all
+if ($mask -eq 0) { $mask = $all }
+$cpus = 0
+for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
+# The processes (Jobs), threads each and power of the shards, and the threads of the single-process steps (Budget).
+# A process scales to a few threads (4: 85%), and each translates the programs its share needs. By default the
+# allowed CPUs' share of the cores less one, at reduced power: an SMT sibling adds little compile throughput and the
+# most heat, and one core stays free for the rest of the PC. -FullSpeed: every allowed CPU at full power.
+function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$threads, [int]$jobs, [bool]$fullSpeed) {
+	if ($fullSpeed) {
+		if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Ceiling($cpus / $threads)) }
+		return [pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$cpus; Efficient = $false }
+	}
+	$cores = [math]::Floor($cpus * [math]::Min($physical, $logical) / $logical)
+	$budget = [math]::Max(1, $cores - 1)
+	$threads = [math]::Min($threads, $budget)
+	if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Floor($budget / $threads)) }
+	[pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$budget; Efficient = $true }
+}
+$plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent
+if ($PlanOnly) {
+	[pscustomobject]@{ Cpus = $cpus; Jobs = $plan.Jobs; Threads = $plan.Threads; Budget = $plan.Budget; Efficient = $plan.Efficient } |
+		ConvertTo-Json -Compress
+	return
+}
 
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
 # The game's sce_sys\param.json (its title and version). The game is its folder (eboot.bin and sce_sys) or the
@@ -173,18 +218,7 @@ function Get-SeedPipelines([string]$file) {
 		$stream.Dispose()
 	}
 }
-if ($Affinity -eq 0) {
-	$config = @("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } |
-		Select-Object -First 1
-	foreach ($cpu in (Get-Content $config -Raw | ConvertFrom-Json).cpu_affinity) { $Affinity = $Affinity -bor ([int64]1 -shl [int]$cpu) }
-}
-$all = if ([Environment]::ProcessorCount -ge 64) { [int64]-1 } else { ([int64]1 -shl [Environment]::ProcessorCount) - 1 }
-$mask = $Affinity -band $all
-if ($mask -eq 0) { $mask = $all }
-$cpus = 0
-for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
-# A process scales to a few threads (4: 85%), and each translates the programs its share needs.
-if ($Jobs -le 0) { $Jobs = [math]::Max(1, [math]::Ceiling($cpus / $Threads)) }
+$Jobs, $Threads = $plan.Jobs, $plan.Threads
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logs = if (Test-Path "$PSScriptRoot\_Build") { "$PSScriptRoot\_Build\run-logs" } else { "$PSScriptRoot\logs" }
 $logs = "$logs\$stamp-precompile"
@@ -192,6 +226,21 @@ $logName = $logs.Substring($PSScriptRoot.Length + 1)
 New-Item -ItemType Directory -Force $logs | Out-Null
 $begin = Get-Date
 
+# Reduced power for a precompile process (Windows EcoQoS: every thread of it, the driver's too, at lower clocks).
+if (!('Kyty.ProcessPower' -as [type])) {
+	Add-Type -Namespace Kyty -Name ProcessPower -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct PowerThrottlingState { public uint Version; public uint ControlMask; public uint StateMask; }
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool SetProcessInformation(IntPtr process, int informationClass, ref PowerThrottlingState information, uint size);
+// ProcessPowerThrottling (4), PROCESS_POWER_THROTTLING_CURRENT_VERSION (1), PROCESS_POWER_THROTTLING_EXECUTION_SPEED (1).
+public static bool Throttle(IntPtr process) {
+	var state = new PowerThrottlingState { Version = 1, ControlMask = 1, StateMask = 1 };
+	return SetProcessInformation(process, 4, ref state, 12);
+}
+'@
+}
+$reducedPower = 'on'
 # Each process gets an empty NVIDIA disk cache of its own (nothing trained yet), removed when it is done.
 $nvidiaCaches = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-$stamp"
 function Start-Precompile([string]$name, [string[]]$arguments) {
@@ -200,6 +249,10 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
 	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+	if ($plan.Efficient -and ![Kyty.ProcessPower]::Throttle($process.Handle) -and $script:reducedPower -ne 'unavailable') {
+		$script:reducedPower = 'unavailable'
+		Write-Host 'precompile: this Windows has no reduced-power mode (EcoQoS); the processes run at full power'
+	}
 	$process.ProcessorAffinity = [IntPtr]$mask
 	$null = $process.Handle # keeps the exit code readable after the process ends
 	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
@@ -211,18 +264,18 @@ function Wait-Precompile($process, [string]$what) {
 	if ($process.ExitCode -ne 0) { throw "$what failed; logs: $logName" }
 }
 
-Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time, affinity 0x$('{0:X}' -f $mask); logs $logName"
+Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time of $Threads threads, affinity 0x$('{0:X}' -f $mask), $(if ($plan.Efficient) { 'reduced power (-FullSpeed: every CPU at full power)' } else { 'full power' }); logs $logName"
 try {
 if ($Coverage) {
 	$out = [IO.Path]::ChangeExtension($Seeds, '.compiled.shaders')
-	Wait-Precompile (Start-Precompile 'coverage' @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus",
+	Wait-Precompile (Start-Precompile 'coverage' @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$($plan.Budget)",
 		'--out', "`"$out`"")) 'coverage'
 	Write-Host "wrote $out"
 	return
 }
 # The compiled inputs for the emulator's shader prefetch: the seeds translated as the full run does,
 # without pipelines (half a minute).
-$inputs = @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$cpus", '--static-inputs')
+$inputs = @('--seeds', "`"$Seeds`"", '--no-pipelines', '--threads', "$($plan.Budget)", '--static-inputs')
 if ($InputsOnly) {
 	Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 	Write-Host "inputs saved beneath $CacheRoot (producer and integrity checked on load)"
@@ -231,8 +284,9 @@ if ($InputsOnly) {
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
 $pending = [System.Collections.Generic.Queue[object]]::new()
-for ($i = 0; $i -lt $Shards; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
-if ($Recorded -and (Test-Path $Recorded)) {
+$count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
+for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
+if ($ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)) {
 	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
 	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
 	for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Recorded, "$i/$count")) }
@@ -275,6 +329,10 @@ while ($pending.Count -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
+if ($ShardLimit -gt 0) {
+	Write-Host ("{0} of {1} shards done in {2:hh\:mm\:ss} ({3} split); not merged (-ShardLimit)" -f $finished, $Shards, ((Get-Date) - $begin), $split)
+	return
+}
 Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\$gameId.bin", "$CacheRoot\static-v1\driver-v1\*\$gameId.binaries" -ErrorAction SilentlyContinue |

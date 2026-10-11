@@ -29,6 +29,9 @@ bool SetProcessDefaultCpuList(const char* list);
 // Opaque handle of the calling thread for ThreadCpuSeconds (valid while the thread runs).
 uint64_t CurrentThreadHandle();
 double   ThreadCpuSeconds(uint64_t handle);
+// Kernel + user time of the calling thread, in ns units (OS accounting granularity).
+// false means unavailable; zero is a valid measured value. No thread handle is opened.
+bool CurrentThreadCpuNanoseconds(uint64_t* nanoseconds);
 // The calling thread's run time in TSC ticks (Windows: QueryThreadCycleTime; exact, unlike the
 // tick-sampled ThreadCpuSeconds). Linux: 0.
 uint64_t CurrentThreadCycles();
@@ -63,6 +66,13 @@ bool FlushProcessWriteBuffers();
 // below-normal priority too: background work that must not hold up the game's threads.
 void AvoidCpuList(const char* avoid_cpus);
 void MakeBackgroundThread(const char* avoid_cpus);
+// A pipeline compile worker: MakeBackgroundThread, and with `efficient` also at reduced power where
+// the host has it (Windows: EcoQoS, which lowers the clock the thread runs at, not only its
+// priority), unless KYTY_COMPILE_EFFICIENCY=0. True when the thread now runs power-throttled.
+bool MakeCompileThread(const char* avoid_cpus, bool efficient);
+// Whether the calling thread runs power-throttled (Windows EcoQoS); false where the host has no
+// such state.
+bool ThreadPowerThrottled();
 // The calling thread above the normal priority of the game's threads (Windows:
 // THREAD_PRIORITY_HIGHEST; Linux: unchanged): the render thread, which every frame waits for, is
 // not time-sliced against them on its CPUs.

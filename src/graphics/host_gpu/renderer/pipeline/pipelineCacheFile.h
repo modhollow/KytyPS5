@@ -45,6 +45,9 @@ Decoded               Read(const std::filesystem::path& path, const Identity& id
 bool                  Current(const std::filesystem::path& path, const Identity& identity,
                               const std::filesystem::path& seeds);
 const char*           Reason(Error error);
+// Convert only at native I/O boundaries; already-explicit namespaces retain their meaning.
+std::filesystem::path NativePath(const std::filesystem::path& logical);
+bool                  CreateDirectories(const std::filesystem::path& logical);
 std::filesystem::path Temporary(const std::filesystem::path& destination);
 bool Replace(const std::filesystem::path& temporary, const std::filesystem::path& destination);
 

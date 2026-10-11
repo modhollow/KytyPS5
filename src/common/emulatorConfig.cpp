@@ -142,4 +142,8 @@ const Keymap& GetKeymap() {
 	return g_config->keymap;
 }
 
+const std::vector<std::string>& GetGuestArguments() {
+	return g_config->guest_arguments;
+}
+
 } // namespace Config

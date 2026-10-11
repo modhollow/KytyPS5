@@ -77,6 +77,8 @@ struct ConfigOptions {
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;
+	// Ordinary boots need a non-null argv[0]; --guest-exec supplies the caller's arguments.
+	std::vector<std::string> guest_arguments {""};
 };
 
 void Load(const ConfigOptions& cfg);
@@ -119,7 +121,8 @@ bool PlayGoHackEnabled();
 bool RedZoneProtectionEnabled();
 #endif
 
-const Keymap& GetKeymap();
+const Keymap&                   GetKeymap();
+const std::vector<std::string>& GetGuestArguments();
 
 } // namespace Config
 

@@ -6,6 +6,7 @@
 #include <string>
 #include <type_traits>
 #include <vulkan/vulkan.hpp>
+#include "graphics/host_gpu/renderer/pipeline/pipelineAttemptTrace.h"
 
 namespace Libs::Graphics {
 

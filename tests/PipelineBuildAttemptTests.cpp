@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 #include <vulkan/vulkan.hpp>
+#include "graphics/host_gpu/renderer/pipeline/pipelineAttemptTrace.h"
 
 namespace {
 unsigned failures = 0;
@@ -179,6 +180,9 @@ struct ApplicationBackend {
 		vk::PipelineCreateFlags flags;
 		PipelineBinaries::Key   state;
 		vk::Result              result = vk::Result::eErrorUnknown;
+		uint64_t effective_flags = 0, output_handle = 0;
+		std::vector<uint64_t> chain_types;
+		bool operator==(const Request&) const = default;
 	};
 	std::map<uint64_t, std::set<PipelineBinaries::Key>> caches;
 	unsigned              compiled_outputs = 0, ordinary_calls = 0, probes = 0, binary_calls = 0,
@@ -187,14 +191,30 @@ struct ApplicationBackend {
 	uint64_t              next_pipeline = 100;
 	std::vector<uint64_t> cache_arguments;
 	std::vector<Request>  requests;
+	std::function<void(bool, bool)> advance;
 	template <typename Info>
 	vk::Result Create(PipelineCache::Pipeline& pipeline, vk::PipelineCache cache,
 	                  const Info& info) {
 		cache_arguments.push_back(HandleNumber(cache));
 		const auto key      = StateOf(info);
 		auto&      observed = requests.emplace_back(Request {HandleNumber(cache), info.flags, key});
+		observed.effective_flags = PipelineAttemptTrace::EffectiveFlags(info);
+		for (auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next != nullptr; next = next->pNext) {
+			observed.chain_types.push_back(static_cast<uint32_t>(next->sType));
+			if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR)
+				observed.chain_types.push_back(reinterpret_cast<const VkPipelineCreateFlags2CreateInfoKHR*>(next)->flags);
+			if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR) {
+				const auto* binary = reinterpret_cast<const VkPipelineBinaryInfoKHR*>(next);
+				observed.chain_types.push_back(binary->binaryCount);
+				for (uint32_t n = 0; n < binary->binaryCount; ++n)
+					observed.chain_types.push_back(HandleNumber(vk::PipelineBinaryKHR(binary->pPipelineBinaries[n])));
+			}
+		}
+		if (advance) advance(bool(info.flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired),
+		                     bool(info.flags & vk::PipelineCreateFlagBits::eDisableOptimization));
 		const auto completed = [&](vk::Result result) {
 			observed.result = result;
+			observed.output_handle = HandleNumber(pipeline.pipeline);
 			return result;
 		};
 		if (const auto* base = Find(info.pNext, VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR)) {
@@ -274,6 +294,15 @@ struct Harness {
 		PipelineCache::Pipeline pipeline;
 		const auto              flags = info.flags;
 		const auto*             next  = info.pNext;
+		const auto bytes = [](const auto& value) {
+			std::array<unsigned char, sizeof(value)> out {};
+			std::memcpy(out.data(), &value, sizeof(value));
+			return out;
+		};
+		const auto before_info = bytes(info);
+		const auto before_stages = bytes(stages);
+		const auto before_rendering = bytes(rendering);
+		const auto before_spec = bytes(spec);
 		const auto              result =
 		    CreatePipelineHandle(graphics, pipeline, info, driver_cache, mode,
 		                         [&](vk::PipelineCache cache, const Info& requested) {
@@ -281,6 +310,9 @@ struct Harness {
 		                         });
 		Check(info.flags == flags && info.pNext == next,
 		      "caller flags and pNext must remain unchanged");
+		Check(bytes(info) == before_info && bytes(stages) == before_stages &&
+		          bytes(rendering) == before_rendering && bytes(spec) == before_spec,
+		      "caller input objects and pointer bytes remain unchanged");
 		return {result, pipeline};
 	}
 };
@@ -448,11 +480,212 @@ void Exercise(const char* stage) {
 			      prefix + "binary capture retains full policy and mandatory null cache");
 	}
 }
+
+struct AttributionClock {
+	uint64_t wall = 0, cpu = 0;
+	bool available = true;
+	unsigned samples = 0;
+	std::vector<PipelineAttemptTrace::Record> records;
+	static PipelineAttemptTrace::Sample Sample(void* pointer) noexcept {
+		auto& clock = *static_cast<AttributionClock*>(pointer);
+		++clock.samples;
+		return {clock.wall, clock.cpu, clock.available};
+	}
+	static void Emit(void* pointer, const PipelineAttemptTrace::Record& record) noexcept {
+		static_cast<AttributionClock*>(pointer)->records.push_back(record);
+	}
+	void Advance(bool probe, bool fast) {
+		// Independent scripted durations. No real sleep and no prediction of a driver.
+		wall += probe ? (fast ? 1000000u : 600000000u) : 3000000u;
+		cpu += probe ? (fast ? 0u : 450000000u) : 2000000u;
+	}
+	PipelineAttemptTrace::Observer Observer() {
+		records.reserve(64);
+		PipelineAttemptTrace::Observer observer;
+		observer.context.shaders[0] = {VK_SHADER_STAGE_COMPUTE_BIT, 0x123456789abcdef0ull, true};
+		observer.context.shader_count = 1;
+		observer.context.caller = PipelineAttemptTrace::Caller::Foreground;
+		observer.context.driver_cache = PipelineAttemptTrace::DriverCache::Main;
+		observer.context.mode = PipelineAttemptTrace::Mode::Fast;
+		observer.context.cache_control = true;
+		observer.user = this;
+		observer.sample = Sample;
+		observer.emit = Emit;
+		return observer;
+	}
+};
+
+template <typename Info>
+void ExerciseAttribution(const char* stage) {
+	namespace Trace = PipelineAttemptTrace;
+	const std::string prefix = std::string(stage) + " attribution: ";
+	{
+		Harness<Info> h;
+		AttributionClock clock;
+		auto observer = clock.Observer();
+		h.backend.advance = [&](bool probe, bool fast) { clock.Advance(probe, fast); };
+		std::pair<vk::Result, PipelineCache::Pipeline> result;
+		{
+			Trace::ScopedObserver active(&observer);
+			result = h.Attempt(PipelineBuild::Fast);
+		}
+		Check(result.first == vk::Result::eSuccess && result.second.pipeline != nullptr && result.second.unoptimized,
+		      prefix + "scripted cold Fast request retains its real output");
+		Check(clock.records.size() == 3, prefix + "three real attempts have separate records (honest RED oracle)");
+		if (clock.records.size() == 3) {
+			const std::array roles {Trace::Operation::OptimizedProbe, Trace::Operation::FastProbe, Trace::Operation::DriverCreate};
+			const std::array<uint64_t, 3> walls {600000000u, 1000000u, 3000000u};
+			const std::array<uint64_t, 3> cpus {450000000u, 0u, 2000000u};
+			for (size_t n = 0; n < 3; ++n) {
+				const auto& record = clock.records[n];
+				Check(record.operation == roles[n] && record.cache == Trace::Cache::Driver &&
+				          record.context == observer.context && record.flags_available &&
+				          record.flags == h.backend.requests[n].effective_flags &&
+				          record.result_kind == Trace::ResultKind::Vulkan &&
+				          record.result == static_cast<int32_t>(h.backend.requests[n].result),
+				      prefix + "role/hash/cache/mode/flags/result agree with each real callback");
+				Check(record.wall_available && record.wall_ns == walls[n] &&
+				          record.thread_cpu_available && record.thread_cpu_ns == cpus[n],
+				      prefix + "slow optimized probe and cheap Fast work remain distinct");
+			}
+			Check(clock.wall == 604000000u && clock.records[0].wall_ns == 600000000u,
+			      prefix + "604ms total cannot be mislabeled as final 3ms driver-create time");
+		}
+		Check(Trace::active == nullptr, prefix + "thread-local observer is restored");
+	}
+	{
+		Harness<Info> h;
+		AttributionClock clock;
+		clock.available = false;
+		auto observer = clock.Observer();
+		h.backend.advance = [&](bool probe, bool fast) { clock.Advance(probe, fast); };
+		{
+			Trace::ScopedObserver active(&observer);
+			h.Attempt(PipelineBuild::Fast);
+		}
+		Check(clock.records.size() == 3, prefix + "unavailable CPU clock still reports attempts");
+		for (const auto& record : clock.records)
+			Check(!record.thread_cpu_available && record.thread_cpu_ns == 0 && record.wall_available,
+			      prefix + "unavailable CPU time is explicit, never wall time");
+	}
+	{
+		AttributionClock outer, inner;
+		auto first = outer.Observer();
+		auto second = inner.Observer();
+		{
+			Trace::ScopedObserver a(&first);
+			{
+				Trace::ScopedObserver b(&second);
+				Trace::Scope scope(Trace::Operation::Bookkeeping);
+				inner.wall = 10;
+				inner.cpu = 2;
+			}
+			Check(Trace::active == &first, prefix + "nested observer restores its parent");
+			{
+				outer.cpu = 100;
+				Trace::Scope scope(Trace::Operation::Bookkeeping);
+				outer.wall = 20;
+				outer.cpu = 99;
+			}
+		}
+		Check(Trace::active == nullptr && inner.records.size() == 1 && outer.records.size() == 1,
+		      prefix + "nested records stay with their own observer");
+		if (outer.records.size() == 1)
+			Check(outer.records[0].wall_available && !outer.records[0].thread_cpu_available,
+			      prefix + "regressing CPU clock is unavailable, never an unsigned duration");
+	}
+
+	enum class Case { Cold, OptimizedHit, FastHit, StaticHit, DisabledControl, NullCache,
+	                  Full, Optimize, Error, BinarySuccess, BinaryFallback, BinaryCapture, BinaryClaimed, BinaryKeyFailed };
+	struct Outcome {
+		vk::Result result;
+		uint64_t pipeline;
+		bool unoptimized;
+		std::vector<ApplicationBackend::Request> requests;
+		std::map<uint64_t, std::set<PipelineBinaries::Key>> caches;
+		std::array<unsigned, 10> counts;
+		PipelineBinaries::Key last_key;
+		bool operator==(const Outcome&) const = default;
+	};
+	for (const auto scenario : {Case::Cold, Case::OptimizedHit, Case::FastHit, Case::StaticHit,
+	                           Case::DisabledControl, Case::NullCache, Case::Full, Case::Optimize,
+	                           Case::Error, Case::BinarySuccess, Case::BinaryFallback,
+	                           Case::BinaryCapture, Case::BinaryClaimed, Case::BinaryKeyFailed}) {
+		const auto run = [&](bool enabled) {
+			Harness<Info> h;
+			TestStore store;
+			TestWriter writer;
+			AttributionClock clock;
+			auto observer = clock.Observer();
+			PipelineBuild mode = PipelineBuild::Fast;
+			auto fast = h.info;
+			fast.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+			switch (scenario) {
+				case Case::OptimizedHit: h.backend.caches[HandleNumber(h.driver_cache)].insert(StateOf(h.info)); break;
+				case Case::FastHit: h.backend.caches[HandleNumber(h.driver_cache)].insert(StateOf(fast)); break;
+				case Case::StaticHit:
+					h.graphics.static_pipeline_cache = h.static_cache;
+					h.backend.caches[HandleNumber(h.static_cache)].insert(StateOf(h.info)); break;
+				case Case::DisabledControl: h.graphics.pipeline_cache_control_enabled = false; break;
+				case Case::NullCache: h.driver_cache = nullptr; break;
+				case Case::Full: mode = PipelineBuild::Full; break;
+				case Case::Optimize: mode = PipelineBuild::Optimize; break;
+				case Case::Error: h.backend.creation_error = true; break;
+				case Case::BinarySuccess:
+				case Case::BinaryFallback:
+					h.graphics.pipeline_binaries = &store;
+					store.entries.insert(StateOf(h.info));
+					h.backend.binary_success = scenario == Case::BinarySuccess; break;
+				case Case::BinaryCapture:
+				case Case::BinaryClaimed:
+				case Case::BinaryKeyFailed:
+					h.graphics.pipeline_binary_writer = &writer;
+					writer.claimed = scenario == Case::BinaryClaimed;
+					h.graphics.device.key_success = scenario != Case::BinaryKeyFailed; break;
+				case Case::Cold: break;
+			}
+			observer.context.mode = mode == PipelineBuild::Fast ? Trace::Mode::Fast :
+			                        mode == PipelineBuild::Optimize ? Trace::Mode::Optimize : Trace::Mode::Full;
+			observer.context.cache_control = h.graphics.pipeline_cache_control_enabled;
+			h.backend.advance = [&](bool probe, bool fast_probe) { clock.Advance(probe, fast_probe); };
+			std::pair<vk::Result, PipelineCache::Pipeline> result;
+			{
+				Trace::ScopedObserver active(enabled ? &observer : nullptr);
+				result = h.Attempt(mode);
+			}
+			Check(Trace::active == nullptr, prefix + "each test restores trace state");
+			if (!enabled) {
+				Check(clock.samples == 0 && clock.records.empty(), prefix + "trace off performs no clock or sink calls");
+			} else {
+				std::vector<Trace::Record> calls;
+				for (const auto& record : clock.records) if (record.flags_available) calls.push_back(record);
+				Check(calls.size() == h.backend.requests.size(), prefix + "every real create call is recorded once");
+				if (calls.size() == h.backend.requests.size()) {
+					for (size_t n = 0; n < calls.size(); ++n)
+						Check(calls[n].context == observer.context && calls[n].flags == h.backend.requests[n].effective_flags &&
+						          calls[n].result_kind == Trace::ResultKind::Vulkan &&
+						          calls[n].result == static_cast<int32_t>(h.backend.requests[n].result),
+						      prefix + "trace agrees with callback sequence without feedback injection");
+				}
+			}
+			return Outcome {result.first, HandleNumber(result.second.pipeline), result.second.unoptimized,
+			                h.backend.requests, h.backend.caches,
+			                {h.backend.compiled_outputs, h.backend.ordinary_calls, h.backend.probes,
+			                 h.backend.binary_calls, h.backend.capture_calls, store.loads,
+			                 writer.captures, writer.copies, h.graphics.device.queries, h.graphics.device.destroys},
+			                h.graphics.device.last_key};
+		};
+		Check(run(false) == run(true), prefix + "trace off/on conserve calls, cache keys, pNext chain, results and outputs");
+	}
+}
+
 } // namespace
 
 int main() {
 	Exercise<vk::ComputePipelineCreateInfo>("compute");
 	Exercise<vk::GraphicsPipelineCreateInfo>("graphics");
+	ExerciseAttribution<vk::ComputePipelineCreateInfo>("compute");
+	ExerciseAttribution<vk::GraphicsPipelineCreateInfo>("graphics");
 	std::printf("PipelineBuildAttemptTests: %u failures (CPU model; no Vulkan driver).\n",
 	            failures);
 	return failures == 0 ? 0 : 1;
