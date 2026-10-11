@@ -1438,13 +1438,20 @@ struct PipelineCache::PendingGraphicsPipeline {
 class PipelineCache::CompileWorkers {
 public:
 	// background: below-normal priority off the render CPUs, and jobs still queued at shutdown are
-	// dropped.
-	explicit CompileWorkers(uint32_t count, bool background = false, const char* label = "compile")
+	// dropped. efficient: background at reduced power too (LocalPlatform::MakeCompileThread), for
+	// work nothing waits for.
+	explicit CompileWorkers(uint32_t count, bool background = false, const char* label = "compile",
+	                        bool efficient = false)
 	    : m_background(background), m_label(label) {
 		for (uint32_t i = 0; i < count; i++)
-			m_threads.emplace_back([this] {
-				if (m_background)
-					LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+			m_threads.emplace_back([this, count, efficient, first = i == 0] {
+				if (m_background) {
+					const bool throttled = LocalPlatform::MakeCompileThread(
+					    std::getenv("KYTY_RENDER_CPUS"), efficient);
+					if (efficient && first)
+						PipelineCacheLog("Compile workers ({}): {} threads, reduced power {}",
+						                 m_label, count, throttled ? "on" : "off");
+				}
 				Run();
 			});
 	}
@@ -1542,8 +1549,11 @@ PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 
 PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
 	if (m_optimize_workers == nullptr) {
+		// Nothing waits for these (the unoptimized pipeline draws until PromoteOptimized): at
+		// reduced power, a cooler CPU for optimized pipelines that arrive a little later.
+		// KYTY_COMPILE_EFFICIENCY=0 runs them at full power.
 		m_optimize_workers = std::make_unique<CompileWorkers>(
-		    std::max(2u, std::thread::hardware_concurrency() / 4u), true, "optimize");
+		    std::max(2u, std::thread::hardware_concurrency() / 4u), true, "optimize", true);
 	}
 	return *m_optimize_workers;
 }

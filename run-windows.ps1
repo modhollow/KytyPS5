@@ -462,13 +462,22 @@ if ($Prompt -and ($offer -or !$tested)) {
 	$info += if ($tested) { ', a tested version.' } else { "`n⚠ This version is untested (the emulator was tested with $($testedVersions -join ' and ')): it may not run or may fail." }
 	if ($offer) {
 		$minutes = [math]::Ceiling(55 * 22 / $cpus / 10) * 10
+		# The precompile's default plan (the cores less one, at reduced power: precompile-windows.ps1 -PlanOnly) ran
+		# 2 processes instead of 6 on a 16-thread PC and took about twice as long, about 70% of the peak CPU power
+		# (10-11): the time is scaled by (whole-CPU processes / plan's processes)^0.63.
+		$plan = try { & "$PSScriptRoot\precompile-windows.ps1" -PlanOnly -Affinity $mask | ConvertFrom-Json } catch { $null }
+		if ($plan -and $plan.Efficient) {
+			$fullJobs = [math]::Max(1, [math]::Ceiling($cpus / 3))
+			$minutes = [math]::Ceiling($minutes * [math]::Pow($fullJobs / [math]::Max(1, $plan.Jobs), 0.63) / 10) * 10
+		}
+		$load = if ($plan -and $plan.Efficient) { 'at reduced CPU load to keep it cooler (precompile-windows.ps1 -FullSpeed: the whole CPU, about twice as fast and hotter)' } else { 'with the CPU fully loaded' }
 		$time = if ($minutes -lt 90) { "about $minutes minutes" } else { 'about {0:N1} hours' -f ($minutes / 60) }
 		$message = if ($cacheOutdated) {
 			"$info`n`nThis version of the emulator precompiles more of the game's shaders than the one that made the precompiled shaders on this PC: the new ones would stutter the first time they appear.`n" +
-				"Precompiling again compiles only what is new (minutes; at most $time on this PC, with the CPU fully loaded; closing its window stops it, and the next run continues)."
+				"Precompiling again compiles only what is new (minutes; at most $time on this PC, $load; closing its window stops it, and the next run continues)."
 		} else {
 			"$info`n`nThe shaders are not precompiled for this graphics card yet: scenes and effects stutter the first time they appear in the game (a fraction of a second to a few seconds).`n" +
-				"The precompile compiles every shader of the game once: $time on this PC (with the CPU fully loaded; closing its window stops it, and the next run continues). " +
+				"The precompile compiles every shader of the game once: $time on this PC ($load; closing its window stops it, and the next run continues). " +
 				"It is needed only once, and again after a graphics driver update."
 		}
 		$choice, $never = Show-Choice $message @('Precompile first, then start the game', 'Start the game now', 'Quit') "Don't ask about precompiling again"

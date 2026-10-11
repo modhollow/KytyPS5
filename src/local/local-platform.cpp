@@ -730,6 +730,27 @@ void MakeBackgroundThread(const char* avoid_cpus) {
 	AvoidCpuList(avoid_cpus);
 }
 
+bool MakeCompileThread(const char* avoid_cpus, bool efficient) {
+	MakeBackgroundThread(avoid_cpus);
+	const char* setting = std::getenv("KYTY_COMPILE_EFFICIENCY");
+	if (!efficient || (setting != nullptr && std::strcmp(setting, "0") == 0)) return false;
+	THREAD_POWER_THROTTLING_STATE state {};
+	state.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+	state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	state.StateMask   = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	return SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state)) !=
+	           0 &&
+	       ThreadPowerThrottled();
+}
+
+bool ThreadPowerThrottled() {
+	THREAD_POWER_THROTTLING_STATE state {};
+	state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+	return GetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state)) !=
+	           0 &&
+	       (state.ControlMask & state.StateMask & THREAD_POWER_THROTTLING_EXECUTION_SPEED) != 0;
+}
+
 void MakeCriticalThread() {
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
@@ -997,6 +1018,16 @@ void AvoidCpuList(const char* avoid_cpus) {
 void MakeBackgroundThread(const char* avoid_cpus) {
 	(void)setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), 10);
 	AvoidCpuList(avoid_cpus);
+}
+
+// No per-thread power state here: background priority only.
+bool MakeCompileThread(const char* avoid_cpus, bool /*efficient*/) {
+	MakeBackgroundThread(avoid_cpus);
+	return false;
+}
+
+bool ThreadPowerThrottled() {
+	return false;
 }
 
 void MakeCriticalThread() {}
