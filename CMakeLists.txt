@@ -624,6 +624,19 @@ if(WIN32)
 	target_link_libraries(compile_thread_power_tests PRIVATE dxgi)
 endif()
 
+# Paths past MAX_PATH are a Windows matter.
+if(WIN32)
+	add_executable(pipeline_binaries_long_path_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/PipelineBinariesLongPathTests.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineBinaries.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCacheFile.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+		"${KYTY_SOURCE_DIR}/local/local-platform.cpp")
+	target_link_libraries(pipeline_binaries_long_path_tests PRIVATE common xxhash fmt::fmt Vulkan::Headers
+	                      Threads::Threads dxgi)
+	target_include_directories(pipeline_binaries_long_path_tests PRIVATE ${inc_headers} "${KYTY_SOURCE_DIR}/local")
+endif()
+
 add_executable(dispatch_batch_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DispatchBatchPolicyTests.cpp"
 )
@@ -791,6 +804,8 @@ if(BUILD_TESTING)
 	add_test(NAME compile_thread_power COMMAND $<TARGET_FILE:compile_thread_power_tests>)
 	set_tests_properties(compile_thread_power PROPERTIES TIMEOUT 15)
 	if(WIN32)
+		add_test(NAME pipeline_binaries_long_path COMMAND $<TARGET_FILE:pipeline_binaries_long_path_tests>)
+		set_tests_properties(pipeline_binaries_long_path PROPERTIES TIMEOUT 15)
 		find_program(KYTY_PWSH pwsh)
 		if(KYTY_PWSH)
 			add_test(NAME precompile_plan
