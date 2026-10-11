@@ -12,6 +12,11 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
+# Recoverable exits also need unwind cleanup in the ordinary consumer frames.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(common PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:-fexceptions>")
+endif()
+
 target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE
@@ -27,7 +32,6 @@ target_link_libraries(common
 		kyty_git_version
 		spdlog::spdlog
 		ZArchive::zarchive
-		nlohmann_json::nlohmann_json
 )
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)

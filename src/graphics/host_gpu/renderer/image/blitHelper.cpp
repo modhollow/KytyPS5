@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 
 namespace Libs::Graphics {
 
@@ -36,8 +37,9 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_pipeline_layout),
 	    "create BlitHelper pipeline layout");
 
-	m_vertex_shader   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_graphics.device);
-	m_fragment_shader = CompileSPV(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, m_graphics.device);
+	m_vertex_shader = CreateShader(GPU_BLIT_FS_TRIANGLE_SPV, std::size(GPU_BLIT_FS_TRIANGLE_SPV));
+	m_fragment_shader =
+	    CreateShader(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, std::size(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV));
 }
 
 BlitHelper::~BlitHelper() {
@@ -58,6 +60,17 @@ BlitHelper::~BlitHelper() {
 	}
 }
 
+vk::ShaderModule BlitHelper::CreateShader(const uint32_t* code, size_t words) const {
+	EXIT_IF(code == nullptr || words == 0);
+	vk::ShaderModuleCreateInfo create {};
+	create.codeSize         = words * sizeof(uint32_t);
+	create.pCode            = code;
+	vk::ShaderModule module = nullptr;
+	RequireVulkanSuccess(m_graphics.device.createShaderModule(&create, nullptr, &module),
+	                     "create BlitHelper shader module");
+	return module;
+}
+
 vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	const auto cached = std::ranges::find(m_pipelines, key, &Pipeline::key);
 	if (cached != m_pipelines.end()) {
@@ -75,7 +88,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	stages[1].module = m_fragment_shader;
 	stages[1].pName  = "main";
 
-	vk::PipelineVertexInputStateCreateInfo vertex_input {};
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
 	input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
 	vk::PipelineViewportStateCreateInfo viewport {};
@@ -149,7 +162,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	const auto destination_view  = destination.FindView(destination_view_info);
 
 	auto& command_buffer = m_scheduler.Current();
-	auto  command        = command_buffer.Handle();
+	command_buffer.InvalidateGraphicsState();
+	auto command = command_buffer.Handle();
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
 	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
@@ -193,8 +207,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
-	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
-	m_scheduler.GetDynamicState().Invalidate();
 }
 
 } // namespace Libs::Graphics

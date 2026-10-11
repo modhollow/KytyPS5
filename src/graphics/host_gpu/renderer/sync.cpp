@@ -12,6 +12,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "live-trace.h"
 
 #include <cstring>
 #include <limits>
@@ -78,6 +79,8 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
                                  uint32_t context_id = 0) {
 	EXIT_IF(destination == 0);
 	(void)buffer.Handle();
+	LiveTrace::Event(LiveTrace::LabelWrite, destination,
+	                 (value & 0xffffffffffffull) | uint64_t {1} << 56u);
 
 	const auto width      = static_cast<uint32_t>(size);
 	const auto value_low  = static_cast<uint32_t>(value);
@@ -102,14 +105,34 @@ void WriteAtEndOfPipeGds32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* 
                            uint32_t dw_offset, uint32_t dw_num) {
 	EXIT_IF(dst_gpu_addr == nullptr);
 	(void)buffer.Handle();
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id,
-	                    dw_offset, dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id, dw_offset,
+	                    dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
 }
 
 void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
                         uint64_t value) {
 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
+}
+
+void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
+                                  uint64_t value) {
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
+
+	LOGF_COLOR(Log::Color::BrightGreen,
+	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
+}
+
+void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
+                                               uint64_t* dst_gpu_addr, uint64_t value) {
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
+
+	LOGF_COLOR(Log::Color::BrightGreen,
+	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
+	           reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 }
 
 void WriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
@@ -165,6 +188,7 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 		    video_out.SubmitFlipFromGpu(buffer, handle, index, flip_mode, flip_arg, request_id);
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
+			buffer.GetContext().GetGpuResources().NoteGpuFlip();
 			return request_id;
 		}
 		if (result != VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {
@@ -172,7 +196,7 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			     "\n",
 			     result, handle, index, flip_mode, flip_arg);
 		}
-		video_out.WaitForSubmitSlot(handle);
+		video_out.WaitForSubmitSlot();
 	}
 }
 

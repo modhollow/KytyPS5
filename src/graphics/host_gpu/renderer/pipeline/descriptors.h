@@ -9,12 +9,18 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// 1: reuse PreparedBindings storage across operations (fresh contents each time).
+extern "C" volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
+// 1: table dispatches (src/local/table-xpr.inc, KYTY_TABLE_DISPATCH).
+extern "C" volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
 
 struct ShaderStageRuntime;
 
@@ -44,12 +50,13 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
-	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
 };
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
+[[nodiscard]] uint32_t
+NativeDescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& binding);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
 
@@ -64,9 +71,13 @@ template <typename T>
 }
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
-                                                   bool r128 = false);
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size);
+                                                   bool                         r128 = false);
+[[nodiscard]] bool
+IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource& descriptor, const Image& image);
+[[nodiscard]] std::string StorageTextureReport(const ShaderRecompiler::IR::ImageResource& resource,
+                                               const ShaderTextureResource& descriptor,
+                                               uint64_t                     size);
 
 } // namespace Libs::Graphics
 

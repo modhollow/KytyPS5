@@ -4,14 +4,10 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
-#include <cstddef>
-#include <filesystem>
 #include <memory>
-#include <span>
-#include <string_view>
+#include <string>
 
 union SDL_Event;
-struct SDL_Window;
 
 namespace Libs::Graphics {
 
@@ -22,14 +18,22 @@ struct SystemOverlayVisualState {
 	uint64_t revision;
 };
 
-void                     InitializeSplashScreen(const std::filesystem::path& sce_sys);
-void                     HideSplashScreen();
-void                     InitializeSystemOverlayInput(SDL_Window* window);
+// Small panels over the game image, drawn with every frame (dialog or not): the frame rate
+// (KYTY_FPS_HUD), the progress of background work (the shader prefetch) and the debug warp.
+struct SystemOverlayHud {
+	std::string title;  // large first line (empty: no frame rate panel)
+	std::string detail; // small second line
+	std::string status; // the progress line (empty: none), over a bar
+	float       status_fraction = 0.0f;
+	std::string notice; // a text panel (empty: none)
+	vk::Rect2D  region; // the game image in the swapchain image
+	vk::Rect2D  drawn;  // out: the panels, in swapchain pixels
+};
+
+void                     InitializeSystemOverlayInput();
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
-void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
-                                              std::span<const std::byte> icon_png);
 
 class SystemOverlay final {
 public:
@@ -37,7 +41,8 @@ public:
 	~SystemOverlay();
 	KYTY_CLASS_NO_COPY(SystemOverlay);
 
-	[[nodiscard]] bool PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count);
+	[[nodiscard]] bool PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count,
+	                                SystemOverlayHud* hud = nullptr);
 	void               Record(vk::CommandBuffer command, vk::ImageView target);
 	void               ReleaseVulkan();
 

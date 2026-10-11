@@ -5,17 +5,70 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
+#include "local-platform.h"
 
 #include <algorithm>
+#include <thread>
 
 namespace Libs::Graphics {
 
+void RenderMutex::BecomeOwner() {
+	EXIT_IF(t_owner);
+	m_mutex.Lock(); // (no requester inside: a later one finds the owner)
+	m_owner_exists = true;
+	m_asymmetric   = LocalPlatform::FlushProcessWriteBuffers();
+	m_owner_depth  = 0;
+	m_owner_locked = false;
+	t_owner        = true;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::ResignOwner() {
+	EXIT_IF(!t_owner || m_owner_depth != 0);
+	m_mutex.Lock();
+	t_owner        = false;
+	m_owner_exists = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::OwnerLockSlow() {
+	// A requester holds the mutex or is about to: out, and in after it (or the host has no flush:
+	// the mutex always).
+	m_busy.store(0, std::memory_order_release);
+	m_mutex.Lock();
+	m_owner_locked = true;
+}
+
+void RenderMutex::OwnerUnlockSlow() {
+	m_owner_locked = false;
+	m_mutex.Unlock();
+}
+
+void RenderMutex::RequesterLock() {
+	if (t_requester_depth++ != 0) return;
+	m_mutex.Lock();
+	if (!m_owner_exists || !m_asymmetric) return;
+	m_requested.store(1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	// The owner's `busy` store is visible now if it made it, and its next acquisition sees the
+	// request.
+	(void)LocalPlatform::FlushProcessWriteBuffers();
+	while (m_busy.load(std::memory_order_acquire) != 0)
+		std::this_thread::yield();
+}
+
+void RenderMutex::RequesterUnlock() {
+	if (--t_requester_depth != 0) return;
+	m_requested.store(0, std::memory_order_release);
+	m_mutex.Unlock();
+}
+
 RenderContext::RenderContext(GraphicContext& graphics)
-    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_render_executor(*this), m_compute_render_executor(*this),
+      m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
-      m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -28,10 +81,12 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	m_gpu_resources.SetGpu(m_gpu.get());
 }
 
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
+		m_gpu_resources.SetGpu(nullptr);
 		m_gpu->Shutdown();
 		m_gpu.reset();
 	}
@@ -49,100 +104,13 @@ GuestGpu& RenderContext::GetGpu() const {
 	return *m_gpu;
 }
 
+uint64_t RenderContext::FrameNumber() const {
+	return m_gpu != nullptr ? static_cast<uint64_t>(m_gpu->GetFrameNum()) : 0;
+}
+
 VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	EXIT_IF(m_video_out == nullptr);
 	return *m_video_out;
-}
-
-bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	// The host reports the faulting byte, not the instruction's access width. Both caches
-	// resolve its page; guessing a width can cross the end of a valid guest mapping.
-	constexpr uint64_t fault_size = 1;
-	if (!IsMapped(fault_vaddr, fault_size)) {
-		return false;
-	}
-	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
-	}
-	return true;
-}
-
-bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
-	if (!IsMapped(vaddr, size)) {
-		return false;
-	}
-	m_buffer_cache.InvalidateMemory(vaddr, size);
-	m_texture_cache.InvalidateMemory(vaddr, size);
-	return true;
-}
-
-bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
-	if (!GuestRange {vaddr, size}.Valid()) {
-		return false;
-	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	return m_mapped_ranges.Contains(vaddr, size);
-}
-
-void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
-}
-
-void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
-	if (CommandScheduler::InDeferredOperation()) {
-		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
-		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
-		m_buffer_cache.InvalidateMemory(vaddr, size);
-		m_texture_cache.UnmapMemory(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
-	};
-	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
-	// longer accepts external work. Use the guest GPU's state for the teardown route.
-	if (m_gpu == nullptr || m_gpu->IsStopping()) {
-		unmap();
-		return;
-	}
-	m_gpu->SendCommandSync(unmap);
-}
-
-void RenderContext::PrepareBda() {
-	if (!m_bda_logged) {
-		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
-		m_bda_logged = true;
-	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
-	m_fault_process_pending = true;
-}
-
-void RenderContext::RunGarbageCollector() {
-	if (m_fault_process_pending) {
-		m_fault_process_pending = false;
-		m_buffer_cache.ProcessFaultBuffer();
-	}
-	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

@@ -28,10 +28,10 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 	const auto hi    = ir.GetExecHi();
 	const auto saved = ReadU32(inst.dst);
 	if (begin) {
-		const auto low_active = ir.INotEqual(lo, zero);
+		const auto low_active        = ir.INotEqual(lo, zero);
 		instruction_branch_condition = ir.IEqual(ir.BitwiseOr(lo, hi), zero);
-		WriteRawU32(inst.dst, ir.Select(instruction_branch_condition, saved,
-		                               ir.Select(low_active, hi, lo)));
+		WriteRawU32(inst.dst,
+		            ir.Select(instruction_branch_condition, saved, ir.Select(low_active, hi, lo)));
 		// Keep the ISA assignment order: SDST may itself name an EXEC half.
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecHi),
 		            ir.Select(low_active, zero, ir.GetExecHi()));
@@ -41,8 +41,7 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 		    ir.LogicalAnd(ir.LogicalNot(high_active), ir.INotEqual(saved, zero));
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecHi),
 		            ir.Select(instruction_branch_condition, saved, hi));
-		WriteRawU32(inst.dst,
-		            ir.Select(instruction_branch_condition, lo, ReadU32(inst.dst)));
+		WriteRawU32(inst.dst, ir.Select(instruction_branch_condition, lo, ReadU32(inst.dst)));
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo),
 		            ir.Select(high_active, saved,
 		                      ir.Select(instruction_branch_condition, zero, ir.GetExecLo())));
@@ -57,7 +56,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		const auto src = ReadU32(inst.src0);
 		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
 		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		IR::U32 result;
+		IR::U32    result;
 		switch (operation) {
 			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
 			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
@@ -181,12 +180,8 @@ void Translator::EmitControlNop() {
 	ir.Emit(IR::ValueOpcode::ControlNop);
 }
 
-void Translator::S_WAITCNT_VSCNT(const Decoder::Instruction& inst) {
-	const auto count = inst.src1.value & 63u;
-	if (inst.src0.kind != Decoder::OperandKind::Null || (count != 0u && count != 63u)) {
-		EXIT("unsupported partial or register-based S_WAITCNT_VSCNT at 0x%08x", inst.pc);
-	}
-	if (count == 0u) ir.Emit(IR::ValueOpcode::StoreCompletion);
+void Translator::EmitWaitcnt() {
+	ir.Emit(IR::ValueOpcode::Waitcnt);
 }
 
 void Translator::S_BARRIER() {
@@ -247,24 +242,22 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::ScalarSelect64(const Decoder::Instruction& inst,
-                                 const Decoder::Operand& false_source) {
-	// Preserve per-word expressions for descriptor tracking and mask provenance.
+                                const Decoder::Operand&     false_source) {
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
 	const auto rhs           = ReadU32Pair(false_source);
-	const auto selected_mask = IR::U1(
-	    ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(false_source)}));
+	const auto selected_mask = IR::U1(ir.Emit(
+	    IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(false_source)}));
 	const auto selected_mask_valid =
 	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
 	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(false_source)}));
+	if (IsExecOrVcc(inst.dst)) {
+		WriteMask(inst.dst, selected_mask, true);
+		return;
+	}
 	WriteU32Pair(inst.dst,
 	             {ir.Select(condition, lhs[0], rhs[0]), ir.Select(condition, lhs[1], rhs[1])});
-	// Scalar selects preserve the raw pair even when EXEC/VCC holds an address.
-	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
-		ir.SetExec(selected_mask);
-	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
-		ir.SetVcc(selected_mask);
-	} else if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
 		ir.SetThreadBitScalarReg(dst, selected_mask);
 		ir.SetScalarMaskTag(dst, selected_mask_valid);
@@ -283,13 +276,13 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 	const bool mask_source = inst.src0.kind == Decoder::OperandKind::Sgpr ||
 	                         inst.src0.kind == Decoder::OperandKind::ExecLo ||
 	                         inst.src0.kind == Decoder::OperandKind::VccLo;
-	IR::U1 source_mask;
-	IR::U1 source_mask_valid;
+	IR::U1     source_mask;
+	IR::U1     source_mask_valid;
 	if (mask_source) {
 		// A full VCC copy carries its predicate even in wave32; ReadMask also handles
 		// individual 32-bit VCC halves, which cannot preserve that provenance.
-		source_mask = inst.src0.kind == Decoder::OperandKind::VccLo ? ir.GetVcc()
-		                                                          : ReadMask(inst.src0);
+		source_mask =
+		    inst.src0.kind == Decoder::OperandKind::VccLo ? ir.GetVcc() : ReadMask(inst.src0);
 		source_mask_valid = ReadMaskValid(inst.src0);
 	}
 	// Preserve all 64 scalar bits independently of the per-thread predicate.
@@ -308,95 +301,23 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 }
 
 void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
-	const bool source_is_mask = inst.src0.kind == Decoder::OperandKind::Sgpr ||
-	                            inst.src0.kind == Decoder::OperandKind::ExecLo ||
-	                            inst.src0.kind == Decoder::OperandKind::VccLo ||
-	                            (!wide && IsExecOrVcc(inst.src0));
-	const auto source_valid = ReadMaskValid(inst.src0);
-	auto source_live = IR::U1(IR::Value(false));
-	if (source_is_mask) {
-		if (inst.src0.kind == Decoder::OperandKind::VccLo ||
-		    inst.src0.kind == Decoder::OperandKind::VccHi) {
-			source_live = ir.GetVcc();
-		} else {
-			source_live = ReadMask(inst.src0);
-		}
-	}
-	const auto retained_live = ir.LogicalAnd(source_valid, source_live);
-
-	IR::U64 source;
-	if (wide) {
-		source = ReadU64(inst.src0);
-	} else {
-		source = ir.ConstructU64(ReadU32(inst.src0), IR::U32(IR::Value(0u)));
-	}
+	const auto source =
+	    wide ? ReadU64(inst.src0) : ir.ConstructU64(ReadU32(inst.src0), IR::U32(IR::Value(0u)));
 	const auto result = IR::U64(ir.Emit(IR::ValueOpcode::WqmU64, {source}));
 	if (!wide) {
 		const auto low = ir.CompositeExtract(result, 0);
-		const bool destination_is_mask = IsExecOrVcc(inst.dst);
-		const bool destination_is_exec = inst.dst.kind == Decoder::OperandKind::ExecLo ||
-		                                 inst.dst.kind == Decoder::OperandKind::ExecHi;
-		auto old_live = IR::U1(IR::Value(false));
-		if (destination_is_mask) {
-			if (destination_is_exec) {
-				old_live = ir.GetExec();
-			} else {
-				old_live = ir.GetVcc();
-			}
-		}
-
 		// A 32-bit write preserves the other EXEC/VCC half and invalidates any
 		// overlapping SGPR-pair mask provenance through the ordinary scalar path.
 		WriteRawU32(inst.dst, low);
-		if (destination_is_mask) {
-			const auto is_high_half = [](const Decoder::Operand& operand) {
-				return operand.kind == Decoder::OperandKind::ExecHi ||
-				       operand.kind == Decoder::OperandKind::VccHi;
-			};
-			const bool destination_is_high = is_high_half(inst.dst);
-			auto affected_lanes = IR::U1(IR::Value(!destination_is_high));
-			if (program.wave_size == 64u) {
-				const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
-				affected_lanes = ir.ULessThan(lane, IR::U32(IR::Value(32u)));
-				if (destination_is_high) {
-					affected_lanes = ir.LogicalNot(affected_lanes);
-				}
-			}
-
-			IR::U1 live;
-			if (destination_is_exec) {
-				live = ir.GetExec();
-			} else {
-				live = ir.GetVcc();
-			}
-			// A cross-half copy refers to different lanes, so only scalar bits apply.
-			if (is_high_half(inst.src0) == destination_is_high) {
-				live = ir.LogicalOr(retained_live, live);
-			}
-			live = IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {affected_lanes, live, old_live}));
-			if (destination_is_exec) {
-				ir.SetExec(live);
-			} else {
-				ir.SetVcc(live);
-			}
-		}
 		ir.SetScc(ir.INotEqual(low, IR::U32(IR::Value(0u))));
 		return;
 	}
-
-	// WQM adds live lanes but never removes a source lane. Keep that fact separate
-	// from the scalar mask: reconstructing an entry-true predicate from a ballot
-	// otherwise introduces a spurious dependency into every vector write.
-	const auto live = ir.LogicalOr(retained_live, ThreadBit(ExtractU64(result)));
+	const auto mask_valid = ReadMaskValid(inst.src0);
 	WriteOperand(DestinationOperand(inst), result);
-	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
-		ir.SetExec(live);
-	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
-		ir.SetVcc(live);
-	} else if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
-		ir.SetThreadBitScalarReg(dst, live);
-		ir.SetScalarMaskTag(dst, source_valid);
+		ir.SetThreadBitScalarReg(dst, ThreadBit(ExtractU64(result)));
+		ir.SetScalarMaskTag(dst, mask_valid);
 	}
 	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
 }

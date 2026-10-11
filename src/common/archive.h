@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace Common {
@@ -20,6 +21,8 @@ public:
 	[[nodiscard]] uint64_t Tell() const;
 	bool                   Seek(uint64_t offset);
 	void                   Read(void* data, uint32_t size, uint32_t* bytes_read);
+	// A read at `offset` that leaves the position alone: any number of threads can share the file.
+	uint32_t ReadAt(uint64_t offset, void* data, uint32_t size) const;
 
 	KYTY_CLASS_NO_COPY(ArchiveFile);
 

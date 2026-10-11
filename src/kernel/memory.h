@@ -5,8 +5,11 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
-class RenderContext;
+class GpuResourceManager;
 enum class PageFaultAccess;
 } // namespace Libs::Graphics
 
@@ -24,8 +27,6 @@ struct Lifecycle {
 using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
-constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
-constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
 
 struct VirtualQueryInfo {
 	uintptr_t start;
@@ -107,19 +108,62 @@ struct KernelMemoryPoolBlockStats {
 static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
-void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-void                   SetFlexibleMemorySize(uint64_t size);
-int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
-                         int memory_type, int64_t* phys_addr_out, bool automatic = false);
-int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
-bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
-bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+void SetFlexibleMemorySize(uint64_t size);
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// A write of bytes the GPU does not own (no GPU result is written back there while it lasts), one
+// guest mapping's: it does not wait behind TryWriteBacking's writes of GPU results. False when it
+// cannot (TryWriteBacking can).
+bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size);
+bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Destination must be ordinary host storage: copying must not enter guest fault
+// handling. Used by uploads; guest destinations keep TryReadBacking's lock path.
+bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size);
+// The backing bytes of a guest range inside one mapping (readable regardless of the guest
+// range's protection), or null.
+const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size);
+// The same for a range that spans mappings: one (pointer, bytes) piece per mapping, in order.
+bool TryGetBackingPieces(uint64_t vaddr, uint64_t size,
+                         std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
+bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size);
+// Avoid false-sharing read faults only when exact ownership proves clean.
+bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean);
+bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// A read of the range faults (a page the GPU wrote, its bytes read back when the GPU thread reads
+// them): a thread that is not the GPU thread must not read it.
+bool ReadFaults(uint64_t vaddr, uint64_t size);
+// The shader whose resources the GPU thread evaluates (KYTY_SYNC_LOG names it on a drain).
+extern thread_local uint64_t g_srt_shader_hash;
+bool                         IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
+// On failure, optionally return a static diagnostic string (no allocation).
+// The mapped parts of a guest range as they are, unmapped parts as zeros (a texture pool span
+// whose memory the game released). False when the backing store is unavailable.
+bool TryReadMappedOrZero(uint64_t vaddr, void* data, uint64_t size);
+// A page no GPU watcher holds that still faults on writes: back to the guest's own writable
+// protection. False when the guest itself made the range read-only (or it is unknown).
+bool                   RestoreGuestWritable(uint64_t vaddr, uint64_t size);
+bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size,
+                                         const char** failure_reason = nullptr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
-void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
+// The end of the guest mapping (one committed virtual range) `vaddr` lies in; 0 when none.
+[[nodiscard]] uint64_t MappingEnd(uint64_t vaddr);
+// Whether guest mappings cover all of [vaddr, vaddr + size), and the parts they cover (as
+// (address, size), in order): what can be read of a range that reaches into unmapped memory.
+[[nodiscard]] bool IsFullyMapped(uint64_t vaddr, uint64_t size);
+void MappedParts(uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>* parts);
+// `source` names the path in crash reports (PrintWriteBacksOverlapping).
+void WriteBacking(uint64_t vaddr, const void* data, uint64_t size,
+                  const char* source = "image") noexcept;
+// Crash reports: the latest GPU write-backs into guest memory (WriteBacking, newest first) that
+// overlap [vaddr, vaddr + size); false when none does.
+bool PrintWriteBacksOverlapping(uint64_t vaddr, uint64_t size);
+void InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Prepare a host write using normal coherent invalidation; false means use guest faults.
+bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
+void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+// Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
+[[nodiscard]] bool IsGuestMappedAfterChanges(uint64_t vaddr);
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
@@ -191,13 +235,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-void     TestBeforeNextBackingMap(callback_func_t callback);
-void     TestSetBackingReadCallback(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
 void     TestFailNextFixedReserveRangeRegistration();
-void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();

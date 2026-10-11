@@ -23,7 +23,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(g_config == nullptr);
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
-	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
+	EXIT_IF(!IsControllerVibrationIntensityValid(cfg.controller_vibration_intensity));
 
 	*g_config = cfg;
 }
@@ -44,18 +44,6 @@ int32_t GetUserId() {
 	return g_config->user_id;
 }
 
-const std::string& GetAudioInputDevice() {
-	return g_config->audio_input_device;
-}
-
-const std::optional<ControllerColor>& GetControllerColor() {
-	return g_config->controller_color;
-}
-
-uint32_t GetControllerSpeakerVolume() {
-	return g_config->controller_speaker_volume;
-}
-
 uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
 }
@@ -70,18 +58,6 @@ int32_t GetGpuIndex() {
 
 bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
-}
-
-bool HideCursorEnabled() {
-	return g_config->hide_cursor_enabled;
-}
-
-bool VrEnabled() {
-	return g_config->vr_enabled;
-}
-
-bool AmdCpuEnabled() {
-	return g_config->amd_cpu_enabled;
 }
 
 uint32_t GetVblankFrequency() {
@@ -104,7 +80,7 @@ ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }
 
-LogDirection GetShaderLogDirection() {
+ShaderLogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }
 
@@ -124,7 +100,7 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
-LogDirection GetPrintfDirection() {
+OutputDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }
 
@@ -132,8 +108,8 @@ std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
 
-bool ProfilerEnabled() {
-	return g_config->profiler_enabled;
+ProfilerDirection GetProfilerDirection() {
+	return g_config->profiler_direction;
 }
 
 bool SpirvDebugPrintfEnabled() {
@@ -152,24 +128,8 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
-bool SyncRawImageBuffersEnabled() {
-	return g_config->sync_raw_image_buffers;
-}
-
-bool TessellationEnabled() {
-	return g_config->tessellation_enabled;
-}
-
-bool TrophyEnabled() {
-	return g_config->trophy_enabled;
-}
-
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
-}
-
-bool SkipNoticeScreen() {
-	return g_config->skip_notice_screen;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

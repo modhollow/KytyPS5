@@ -14,6 +14,9 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "live-census.h"
+#include "live-counters.h"
+#include "speculation-state.h"
 
 #include <algorithm>
 #include <array>
@@ -69,6 +72,46 @@ constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+// Indirect register tables and indirect command buffers can be written by the GPU (GPU-driven
+// rendering writes per-draw data in compute passes). Like the indirect draw arguments, bring
+// GPU-written bytes back before the command processor reads guest memory; without it a table
+// read before its first download is all zeros (an "unknown register 0" crash at startup).
+// False when a speculative translation refused it (speculation-state.h): the packet applies
+// nothing.
+[[nodiscard]] bool SyncCommandMemory(uint64_t address, uint64_t bytes, const char* what) {
+	LiveCounters::Add(LiveCounters::IndirectTables);
+	LiveCensus::Scope census(LiveCensus::CommandSync, 0, 0);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(address, bytes)) {
+		static std::atomic<uint32_t> logs {0};
+		if (logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("%s: failed to synchronise 0x%016" PRIx64 " (+%" PRIu64
+			     " bytes; image-owned range, reading guest memory)\n",
+			     what, address, bytes);
+		}
+	}
+	const auto* spec = Spec::Current();
+	return spec == nullptr || spec->refused == nullptr;
+}
+
+// An entry of an indirect register table the emulator cannot apply: report the table once in a
+// while and skip the entry (the hardware ignores writes to unused register slots).
+void ReportIndirectRegister(const char* bank, uint64_t address, uint32_t count, uint32_t index,
+                            uint32_t raw_offset, uint32_t value) {
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) >= 8) {
+		return;
+	}
+	std::printf("warning: skipping indirect %s register table entry %u/%u at 0x%016" PRIx64
+	            ": offset=0x%08x value=0x%08x\n",
+	            bank, index, count, address, raw_offset, value);
+	const auto* table = reinterpret_cast<const uint32_t*>(address);
+	for (uint32_t j = 0; j < count && j < 16; j++) {
+		std::printf("\t%s_indirect[%u] offset=0x%08x value=0x%08x\n", bank, j, table[j * 2],
+		            table[j * 2 + 1]);
+	}
+	std::fflush(stdout);
 }
 
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
@@ -179,11 +222,11 @@ static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	r.stencil_compress_disable =
 	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_COMPRESS_DISABLE) != 0;
 	r.depth_compress_disable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_COMPRESS_DISABLE) != 0;
-	r.copy_depth_to_color = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_DEPTH_TO_COLOR) != 0;
-	r.copy_stencil_to_color =
-	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
+	r.copy_depth_to_color    = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_DEPTH_TO_COLOR) != 0;
+	r.copy_stencil_to_color  = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
 	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
 	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
+	EXIT_NOT_IMPLEMENTED(r.copy_depth_to_color || r.copy_stencil_to_color);
 
 	return r;
 }
@@ -315,7 +358,7 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 }
 
 static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_offset,
-                                         uint32_t value) {
+                                          uint32_t value) {
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
 		control.force_z_valid       = (value & 0x20000000u) != 0;
@@ -601,9 +644,9 @@ static void HwCtxSetDepthShadingRateEncodingRegister(CommandProcessor& cp, uint3
 	    KYTY_PM4_GET(value, DB_SHADING_RATE_ENCODING, SHADING_RATE_ENCODING);
 	EXIT_NOT_IMPLEMENTED(shading_rate_encoding > 2u);
 
-	auto& ctx                       = cp.GetCtx();
-	auto  target                    = ctx.GetDepthRenderTarget();
-	target.shading_rate_encoding    = static_cast<uint8_t>(shading_rate_encoding);
+	auto& ctx                    = cp.GetCtx();
+	auto  target                 = ctx.GetDepthRenderTarget();
+	target.shading_rate_encoding = static_cast<uint8_t>(shading_rate_encoding);
 	ctx.SetDepthRenderTarget(target);
 }
 
@@ -1016,8 +1059,8 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_PGM_RSRC1:
 			cs_regs.vgprs =
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_VGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_VGPRS_MASK;
-			cs_regs.priority = (value >> Pm4::COMPUTE_PGM_RSRC1_PRIORITY_SHIFT) &
-			                   Pm4::COMPUTE_PGM_RSRC1_PRIORITY_MASK;
+			cs_regs.priority      = (value >> Pm4::COMPUTE_PGM_RSRC1_PRIORITY_SHIFT) &
+			                        Pm4::COMPUTE_PGM_RSRC1_PRIORITY_MASK;
 			cs_regs.float_mode    = (value >> Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT) &
 			                        Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_MASK;
 			cs_regs.dx10_clamp    = ((value >> Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT) &
@@ -1053,9 +1096,8 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			                         Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC3:
-			cs_regs.shared_vgprs =
-			    (value >> Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT) &
-			    Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK;
+			cs_regs.shared_vgprs = (value >> Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT) &
+			                       Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK;
 			break;
 		case Pm4::COMPUTE_NUM_THREAD_X: cs_regs.num_thread_x = value; break;
 		case Pm4::COMPUTE_NUM_THREAD_Y: cs_regs.num_thread_y = value; break;
@@ -1167,7 +1209,7 @@ static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t 
 }
 
 static void HwShIgnoreUserAccumulatorRegister([[maybe_unused]] uint32_t cmd_offset,
-                                               uint32_t value) {
+                                              uint32_t                  value) {
 	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
 }
 
@@ -1305,6 +1347,7 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	cp.BreakComputeChain();
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
@@ -1330,13 +1373,15 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
+		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
+		cp.DispatchIndirectAddress(args_addr, buffer[2]);
 		return 3;
 	}
 
-	const auto base_addr = cp.GetDispatchIndirectArgsBaseAddress();
-	EXIT_NOT_IMPLEMENTED(base_addr == 0);
-	cp.DispatchIndirect(base_addr + buffer[0], buffer[1]);
+	uint32_t data_offset = buffer[0];
+	uint32_t mode        = buffer[1];
+
+	cp.DispatchIndirect(data_offset, mode);
 
 	return 2;
 }
@@ -1351,6 +1396,10 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (dst != nullptr && buffer_size != 0) {
+		if (buffer_size == 0x840) {
+			cp.ReportLodStats(dst, buffer_size, (buffer[3] & ((1u << 19) | (1u << 18))) != 0);
+			return 4;
+		}
 		memset(dst, 0, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
@@ -1441,6 +1490,14 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(addr, sizeof(uint32_t))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("CondExec: failed to synchronise the predicate at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     addr);
+		}
+	}
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}
@@ -1481,10 +1538,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
-		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
+		cp.ProcessIndirectBuffer({then_buffer, then_num_dw});
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
+		cp.ProcessIndirectBuffer({else_buffer, else_num_dw});
 	}
 
 	return payload_dw;
@@ -1641,12 +1698,8 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto data_offset    = buffer[0];
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
-	// The native indexed packet enables the high-half first-index destination in word 3.
-	const IndirectDrawRegisters registers {
-	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
-	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
+	cp.DrawIndirect(data_offset, draw_initiator, indexed);
 
 	return 4;
 }
@@ -1664,17 +1717,13 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
-	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3.
-	const IndirectDrawRegisters registers {
-	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
-	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     registers, draw_initiator, indexed);
+	                     draw_initiator, indexed);
 
 	return 9;
 }
@@ -1951,9 +2000,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 		     indirect_num_dw, buffer[2]);
 	}
 
+	if (!SyncCommandMemory(reinterpret_cast<uint64_t>(indirect_buffer),
+	                       uint64_t {indirect_num_dw} * sizeof(uint32_t), "IndirectBuffer"))
+		return 3;
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
 
 	return 3;
 }
@@ -1975,6 +2027,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2011,15 +2066,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			if (raw_cmd_offset == 0x24au && value == 0u) {
-				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
-				if (!logged.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
-				}
-				continue;
-			}
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			ReportIndirectRegister("cx", indirect_address, indirect_num_dw, i, raw_cmd_offset,
+			                       value);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2046,6 +2095,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2053,39 +2104,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto value          = indirect_buffer[1];
 
 		// Not sure if this is correct
-		// if (raw_cmd_offset != cmd_offset) {
-		// 	LOGF_COLOR(Log::Color::Red,
-		// 	           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
-		// 	           " -> 0x%08" PRIx32 "\n",
-		// 	           raw_cmd_offset, cmd_offset);
-		// }
-
-		// Not sure if this is correct
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
 		}
 
-		if (cmd_offset >= Pm4::SH_NUM) {
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+		if (cmd_offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset] == nullptr) {
+			ReportIndirectRegister("sh", indirect_address, indirect_num_dw, i, raw_cmd_offset,
+			                       value);
+			continue;
 		}
 
-		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
-
-		if (pfunc == nullptr) {
-			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
-			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
-			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
-		}
-
-		pfunc(cp, cmd_offset, value);
+		g_hw_sh_indirect_func[cmd_offset](cp, cmd_offset, value);
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2108,6 +2137,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2123,23 +2155,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
 		}
-		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+		if (cmd_offset >= Pm4::UC_NUM || g_hw_uc_indirect_func[cmd_offset] == nullptr) {
+			ReportIndirectRegister("uc", indirect_address, indirect_num_dw, i, raw_cmd_offset,
+			                       value);
+			continue;
 		}
-
-		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
-
-		if (pfunc == nullptr) {
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
-			}
-			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
-		}
-		pfunc(cp, cmd_offset, value);
+		g_hw_uc_indirect_func[cmd_offset](cp, cmd_offset, value);
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2273,6 +2294,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
+		bool queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
@@ -2280,9 +2302,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x02:
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				cp.BufferFlush();
+				queued = true;
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
+		}
+		if (queued) {
+			cp.BufferFlush();
 		}
 	};
 
@@ -2321,9 +2346,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
-			cp.BufferFlush();
-		}
+		cp.BufferFlush();
 
 		return 7;
 	}
@@ -2549,7 +2572,7 @@ template <typename T>
 static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
-	constexpr auto value_dw = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
+	constexpr auto value_dw   = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
 	constexpr auto payload_dw = 4u + value_dw * 2u;
 	constexpr auto packet_dw  = payload_dw + 1u;
 	constexpr auto opcode =
@@ -2559,7 +2582,7 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != packet_dw);
 
 	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
-	auto  ctrl = buffer[0];
+	auto           ctrl               = buffer[0];
 	auto* addr = reinterpret_cast<const T*>((buffer[1] & ~address_align_mask) |
 	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
 	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
@@ -2745,10 +2768,9 @@ void GraphicsInitJmpTablesCxIndirect() {
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_128B_BLOCKS) != 0;
 			EXIT_NOT_IMPLEMENTED(independent_64b && independent_128b);
 			dcc.independent_block_size =
-			    independent_64b
-			        ? HW::ColorDccControl::IndependentBlockSize::Bytes64
-			        : independent_128b ? HW::ColorDccControl::IndependentBlockSize::Bytes128
-			                           : HW::ColorDccControl::IndependentBlockSize::Disabled;
+			    independent_64b    ? HW::ColorDccControl::IndependentBlockSize::Bytes64
+			    : independent_128b ? HW::ColorDccControl::IndependentBlockSize::Bytes128
+			                       : HW::ColorDccControl::IndependentBlockSize::Disabled;
 			cp.GetCtx().SetColorDccControl(slot, dcc);
 		};
 	}
@@ -3611,17 +3633,11 @@ void GraphicsInitJmpTablesShIndirect() {
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
@@ -3629,27 +3645,10 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS;
-	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS; offset++) {
-		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetPsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS,
-			                                   value);
-		};
-	}
-	for (uint32_t offset = 4; offset <= 5; offset++) {
-		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetPsAuxiliaryTableAddress(cmd_offset - 4, value);
-		};
-	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	// Toolkit state restoration emits the compiler's GS-front allocation
-	// metadata here. Native GS resource registers already carry that allocation.
-	g_hw_sh_indirect_func[0x0ca] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3671,13 +3670,12 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS;
-	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS; offset++) {
-		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetHsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS,
-			                                   value);
-		};
-	}
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().hs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
@@ -3835,25 +3833,6 @@ void GraphicsInitJmpTablesShIndirect() {
 void GraphicsInitJmpTablesUcIndirect() {
 	for (auto& func: g_hw_uc_indirect_func) {
 		func = nullptr;
-	}
-	for (uint32_t i = 0; i < 4; ++i) {
-		g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_LEFT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrControlPoint(0, cmd_offset - Pm4::FSR_CONTROL_POINTS_LEFT_X, value);
-		};
-		g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_LEFT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrControlPoint(1, cmd_offset - Pm4::FSR_CONTROL_POINTS_LEFT_Y, value);
-		};
-	}
-	for (uint32_t i = 0; i < 2; ++i) {
-		g_hw_uc_indirect_func[Pm4::FSR_ALPHA_LEFT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrAlpha(0, cmd_offset - Pm4::FSR_ALPHA_LEFT_X, value);
-		};
-		g_hw_uc_indirect_func[Pm4::FSR_ALPHA_LEFT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrAlpha(1, cmd_offset - Pm4::FSR_ALPHA_LEFT_Y, value);
-		};
-		g_hw_uc_indirect_func[Pm4::FSR_WINDOW_LEFT + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrWindow(cmd_offset - Pm4::FSR_WINDOW_LEFT, value);
-		};
 	}
 
 	g_hw_uc_indirect_func[Pm4::GE_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {

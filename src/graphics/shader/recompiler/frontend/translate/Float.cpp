@@ -5,16 +5,16 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+bool Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
-		const auto rhs = ReadF16LaneAsF32(inst.src1, high);
+		const auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
+		const auto rhs = ReadF16LaneAsF32(inst.src1, high, true);
 		IR::F32    result;
 		if (accumulator) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high)}));
+			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high, true)}));
 		} else if (inst.src_count == 3u) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high)}));
+			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high, true)}));
 		} else {
 			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
 		}
@@ -43,15 +43,16 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 		result = PackU16Lanes(override_lane(false), override_lane(true));
 	}
 	WriteOperand(raw, result);
+	return true;
 }
 
-void Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                               bool invalid_negative) {
 	const auto argument = ReadF16AsF32(inst.src0);
 	auto       result   = IR::F32(ir.Emit(opcode, {argument}));
 	if (!invalid_negative) {
 		WriteF16(DestinationOperand(inst), result);
-		return;
+		return true;
 	}
 	const auto negative =
 	    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {argument, IR::Value::F32(0.0f)}));
@@ -59,51 +60,52 @@ void Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
 	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 	Write16Bits(DestinationOperand(inst), ir.Select(negative, invalid, bits));
+	return true;
 }
 
-void Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
-	const auto argument = ReadF16AsF32(inst.src0);
-	const auto magnitude =
-	    ir.BitwiseAnd(ir.BitCastU32(argument), IR::U32(IR::Value(0x7fffffffu)));
-	auto result = IR::F32(ir.Emit(opcode, {argument}));
+bool Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+	const auto argument  = ReadF16AsF32(inst.src0);
+	const auto magnitude = ir.BitwiseAnd(ir.BitCastU32(argument), IR::U32(IR::Value(0x7fffffffu)));
+	auto       result    = IR::F32(ir.Emit(opcode, {argument}));
 	if (opcode == IR::ValueOpcode::FPSin) {
 		const auto fraction = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {argument}));
-		const auto whole = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.0f)}));
-		const auto half = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.5f)}));
-		const auto nonzero = ir.INotEqual(magnitude, IR::U32(IR::Value(0u)));
+		const auto whole =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.0f)}));
+		const auto half =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.5f)}));
+		const auto nonzero  = ir.INotEqual(magnitude, IR::U32(IR::Value(0u)));
 		const auto cardinal = ir.LogicalOr(ir.LogicalAnd(whole, nonzero), half);
-		result = IR::F32(ir.Emit(
-		    IR::ValueOpcode::SelectF32, {cardinal, IR::Value::F32(0.0f), result}));
+		result =
+		    IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {cardinal, IR::Value::F32(0.0f), result}));
 	} else {
 		// The architectural quarter-cycle result is exactly zero. Evaluating cos(pi/2) with a
 		// rounded F32 PI can otherwise produce a half-precision subnormal instead.
 		const auto fraction = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {argument}));
-		const auto quarter = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.25f)}));
-		const auto three_quarters = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.75f)}));
-		result = IR::F32(
-		    ir.Emit(IR::ValueOpcode::SelectF32,
-		            {ir.LogicalOr(quarter, three_quarters), IR::Value::F32(0.0f), result}));
+		const auto quarter =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.25f)}));
+		const auto three_quarters =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.75f)}));
+		result = IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {ir.LogicalOr(quarter, three_quarters),
+		                                                      IR::Value::F32(0.0f), result}));
 	}
 
 	const auto infinite = ir.IEqual(magnitude, IR::U32(IR::Value(0x7f800000u)));
 	result              = ApplyF32ResultModifiers(inst.dst, result);
-	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
-	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
+	const auto bits     = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
+	const auto invalid  = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 	Write16Bits(DestinationOperand(inst), ir.Select(infinite, invalid, bits));
+	return true;
 }
 
-void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+bool Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool reverse) {
 	const auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);
 	const auto rhs = ReadF16AsF32(reverse ? inst.src0 : inst.src1);
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {lhs, rhs})));
+	return true;
 }
 
-void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+bool Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                 bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
@@ -111,36 +113,40 @@ void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
 		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
 	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
+	return true;
 }
 
-void Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+bool Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto type = IR::ArgTypeOf(opcode, 0);
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {ReadOperand(inst.src0, type)}));
+	return true;
 }
 
-void Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+bool Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                              bool reverse) {
 	std::array<IR::Value, 2> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = SourceAt(inst, reverse ? 1u - index : index);
-		args[index]        = ReadOperand(operand, IR::ArgTypeOf(opcode, index));
+		args[index]         = ReadOperand(operand, IR::ArgTypeOf(opcode, index));
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1]}));
+	return true;
 }
 
-void Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+bool Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                               bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
-		const auto type    = IR::ArgTypeOf(opcode, index);
-		args[index]        = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
-		                                                  : ReadOperand(operand, type);
+		const auto  type    = IR::ArgTypeOf(opcode, index);
+		args[index]         = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
+		                                                   : ReadOperand(operand, type);
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}));
+	return true;
 }
 
-void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
+bool Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
 	const auto bits = ReadU32(inst.src0);
 	const auto exponent =
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(23u), IR::Value(8u)}));
@@ -158,9 +164,10 @@ void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
 	                                 ir.Select(zero, bits, subnormal));
 	const auto result    = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0xffu))), bits, finite);
 	WriteOperand(DestinationOperand(inst), ir.BitCastF32(result));
+	return true;
 }
 
-void Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
+bool Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
 	auto a          = inst.src0;
 	a.op_sel        = false;
 	a.op_sel_hi     = true;
@@ -174,25 +181,26 @@ void Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
 	const auto acc  = ReadMixF32(inst.dst);
 	const auto lo   = IR::F32(ir.Emit(IR::ValueOpcode::FPFma32, {a_lo, b_lo, acc}));
 	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::FPFma32, {a_hi, b_hi, lo}));
+	return true;
 }
 
-void Translator::V_CUBEID_F32(const Decoder::Instruction& inst) {
+bool Translator::V_CUBEID_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 0u);
 }
 
-void Translator::V_CUBESC_F32(const Decoder::Instruction& inst) {
+bool Translator::V_CUBESC_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 1u);
 }
 
-void Translator::V_CUBETC_F32(const Decoder::Instruction& inst) {
+bool Translator::V_CUBETC_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 2u);
 }
 
-void Translator::V_CUBEMA_F32(const Decoder::Instruction& inst) {
+bool Translator::V_CUBEMA_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 3u);
 }
 
-void Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kind) {
+bool Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kind) {
 	const auto x  = ReadMixF32(inst.src0);
 	const auto y  = ReadMixF32(inst.src1);
 	const auto z  = ReadMixF32(inst.src2);
@@ -232,6 +240,7 @@ void Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 		default: EXIT("invalid cube result kind");
 	}
 	WriteOperand(DestinationOperand(inst), result);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend
