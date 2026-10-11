@@ -563,6 +563,20 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_cache_upgrade_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/PipelineCacheUpgradeTests.cpp"
+    "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCacheFile.cpp"
+)
+target_link_libraries(pipeline_cache_upgrade_tests PRIVATE common xxhash fmt::fmt)
+target_include_directories(pipeline_cache_upgrade_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_cache_native_read_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/PipelineCacheNativeReadTests.cpp"
+    "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCacheFile.cpp"
+)
+target_link_libraries(pipeline_cache_native_read_tests PRIVATE common xxhash fmt::fmt)
+target_include_directories(pipeline_cache_native_read_tests PRIVATE ${inc_headers})
+
 add_executable(static_cache_readiness_tests EXCLUDE_FROM_ALL
     "${KYTY_TESTS_DIR}/StaticCacheReadinessTests.cpp"
     "${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
@@ -575,7 +589,7 @@ if(LINUX)
     target_link_libraries(static_cache_readiness_tests PRIVATE ${CMAKE_DL_LIBS})
 endif()
 find_package(Threads REQUIRED)
-target_link_libraries(static_cache_readiness_tests PRIVATE xxhash fmt::fmt Vulkan::Headers Threads::Threads)
+target_link_libraries(static_cache_readiness_tests PRIVATE common xxhash fmt::fmt Vulkan::Headers Threads::Threads)
 target_include_directories(static_cache_readiness_tests PRIVATE ${inc_headers})
 if(KYTY_CLANG_CL)
     target_compile_options(static_cache_readiness_tests PRIVATE /Gy)
@@ -755,6 +769,8 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME cache_upgrade_compatibility COMMAND $<TARGET_FILE:pipeline_cache_upgrade_tests>)
+	add_test(NAME cache_native_read COMMAND $<TARGET_FILE:pipeline_cache_native_read_tests>)
 	add_test(NAME static_cache_readiness COMMAND $<TARGET_FILE:static_cache_readiness_tests>)
 	add_test(NAME pipeline_capture_contract COMMAND $<TARGET_FILE:pipeline_capture_contract_tests>)
 	add_test(NAME pipeline_build_attempts COMMAND $<TARGET_FILE:pipeline_build_attempt_tests>)
@@ -842,6 +858,8 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		pipeline_cache_upgrade_tests
+		pipeline_cache_native_read_tests
 		static_cache_readiness_tests
 		pipeline_build_attempt_tests
 		ime_dialog_tests

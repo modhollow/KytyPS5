@@ -2048,9 +2048,21 @@ void PipelineCache::InitializeDriverCache() {
 		}
 		m_driver_cache_key = key;
 	}
-	m_driver_cache_path =
-	    PipelineCacheFile::Path(title_id, PipelineCacheRoot(),
-	                            DriverCacheIdentity(m_graphics.GetPhysicalDeviceProperties()));
+	// Resolve the driver root once; a later working-directory change must not move its files.
+	auto cache_root = PipelineCacheRoot();
+#ifdef _WIN32
+	cache_root = PipelineCacheFile::NativePath(cache_root);
+#else
+	std::error_code root_error;
+	cache_root = std::filesystem::absolute(cache_root, root_error);
+	if (root_error) cache_root.clear();
+#endif
+	if (cache_root.empty()) {
+		PipelineCacheLog("Vulkan pipeline cache: disabled (cache root could not be resolved)");
+		return;
+	}
+	m_driver_cache_path = PipelineCacheFile::Path(
+	    title_id, cache_root, DriverCacheIdentity(m_graphics.GetPhysicalDeviceProperties()));
 	// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile up in
 	// it, so past 1 GiB (one build's warmup is ~130 MB) it starts over.
 	m_driver_cache =
@@ -2105,8 +2117,9 @@ void PipelineCache::InitializeDriverCache() {
 // XXH3, the payload; one past `limit` bytes starts over. Null: the cache is disabled.
 vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& file_path,
                                                  uint64_t limit, size_t& loaded_size) {
-	const auto path         = Common::PathToString(file_path);
-	const bool cache_exists = Common::File::IsFileExisting(file_path);
+	const auto path = Common::PathToString(file_path);
+	const bool cache_exists =
+	    Common::File::IsFileExisting(PipelineCacheFile::NativePath(file_path));
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
 	} else {
@@ -2183,7 +2196,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	const auto prefix = PipelineCacheFile::Prefix(
 	    payload, DriverCacheIdentity(m_graphics.GetPhysicalDeviceProperties()), maximum);
 	if (prefix.empty()) return false;
-	if (!Common::File::CreateDirectories(file_path.parent_path())) {
+	if (!PipelineCacheFile::CreateDirectories(file_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return false;
 	}
@@ -2192,7 +2205,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
+	if (file.Create(PipelineCacheFile::NativePath(temp_path))) {
 		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
 		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
 	}
@@ -2201,7 +2214,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
 	    !PipelineCacheFile::Replace(temp_path, file_path)) {
 		std::error_code cleanup_error;
-		std::filesystem::remove(temp_path, cleanup_error);
+		std::filesystem::remove(PipelineCacheFile::NativePath(temp_path), cleanup_error);
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(file_path));
 		return false;
