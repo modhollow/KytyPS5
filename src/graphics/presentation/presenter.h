@@ -4,7 +4,6 @@
 #include "common/common.h"
 
 #include <memory>
-#include <span>
 
 namespace Libs::Graphics {
 
@@ -16,27 +15,27 @@ struct WindowContext;
 class Presenter final {
 public:
 	struct Frame;
-	struct Layer {
-		Frame* frame;
-		int    bus;
-		bool   premultiplied_alpha;
-	};
 
 	explicit Presenter(WindowContext& window);
 	~Presenter();
 	KYTY_CLASS_NO_COPY(Presenter);
 
-	[[nodiscard]] Frame&         PrepareFrame(CommandBuffer& command, const ImageInfo& info);
-	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
-	                                               CommandBuffer* producer = nullptr);
-	[[nodiscard]] bool           PresentLastFrame();
+	[[nodiscard]] Frame& PrepareFrame(CommandBuffer& command, const ImageInfo& info);
+	[[nodiscard]] Frame& PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
+	                                       CommandBuffer* producer = nullptr);
+	[[nodiscard]] Frame* PrepareLastFrame();
+	// The vblank thread, when no flip was presented: shows the frame a present turned away (it came
+	// within a display refresh of the one before) if nothing newer replaced it and the display can
+	// take it now.
+	bool                         PresentSkippedIfDue();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
-	void                         Present(Frame& frame);
-	void                         Present(std::span<const Layer> layers);
-	void                         ClearLayer(int bus);
-	void                         Discard(Frame& frame);
+	// KYTY_FLIP_RATE caps the frame's flip. With frame generation only frames carrying its inputs
+	// are capped (the game's 3D view): movies and menus keep a flip per vblank.
+	[[nodiscard]] static bool FlipRateApplies(const Frame& frame) noexcept;
+	void                      Present(Frame& frame, bool reuse = false);
+	void                      Discard(Frame& frame);
 
 private:
 	struct Impl;

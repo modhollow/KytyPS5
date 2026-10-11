@@ -1,0 +1,47 @@
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// Debug warp for Demon's Souls (PPSA01341): start the character on another map. A warp is armed
+// (F8 with F9/F10 picking the spawn point, or the live command `warp MAP SPAWN`); the next time the
+// game reads its save (Continue on the title screen) it gets a copy whose map and position are
+// those of the chosen spawn point, a player part of the map's MSB file. The save on disk is not
+// touched: the game writes the new location itself when it next saves, which ends the warp.
+namespace Loader::DemonsSoulsWarp {
+
+struct Spawn {
+	std::string map;     // m04_01_00_00
+	std::string name;    // c0000_0001
+	uint32_t    map_uid; // 0x04010000
+	float       x, y, z;
+	float       yaw; // degrees
+};
+
+// The player spawn points of every map (read from the game's MSB files once).
+const std::vector<Spawn>& Spawns();
+
+bool        Arm(std::string_view map, std::string_view spawn);
+void        Disarm();
+void        Select(int step); // F9/F10: the spawn point an F8 arms
+void        ToggleSelected(); // F8
+std::string HudText();        // the panel text (empty: none)
+
+// USR-DATA with the spawn's map and position (the size and FNV-1a checksum recomputed; a save
+// without a position, a character still in the tutorial, gets the entries); false when its layout
+// is unexpected.
+bool PatchSave(std::vector<uint8_t>& data, const Spawn& spawn);
+
+// File system hooks: the host file a read-only open of `real` should open instead (a patched copy
+// of the save while a warp is armed; empty: `real` itself), and a write-open.
+std::filesystem::path RedirectRead(const std::filesystem::path& real);
+void                  NoteWrite(const std::filesystem::path& real);
+// A stat of `real`: the size of the copy a read would get (nothing: its own), without making one.
+std::optional<uint64_t> RedirectedSize(const std::filesystem::path& real);
+
+} // namespace Loader::DemonsSoulsWarp

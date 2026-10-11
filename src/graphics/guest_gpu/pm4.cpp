@@ -60,7 +60,7 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_WRITE_DATA]                = "IT_WRITE_DATA";
 	names[IT_MEM_SEMAPHORE]             = "IT_MEM_SEMAPHORE";
 	names[IT_DRAW_INDEX_INDIRECT_MULTI] = "IT_DRAW_INDEX_INDIRECT_MULTI";
-	names[IT_WAIT_REG_MEM]               = "IT_WAIT_REG_MEM";
+	names[IT_WAIT_REG_MEM]              = "IT_WAIT_REG_MEM";
 	names[IT_INDIRECT_BUFFER]           = "IT_INDIRECT_BUFFER";
 	names[IT_COPY_DATA]                 = "IT_COPY_DATA";
 	names[IT_CP_DMA]                    = "IT_CP_DMA";
@@ -120,15 +120,15 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 		uint32_t len = 0;
 
 		const auto packet_type = static_cast<PacketType>(cmd_id >> 30u);
-		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2 &&
-		                     PacketSizeDw(cmd_id) != 1u);
+		// Type-2 packets are header-only padding; every other packet type requires a body.
+		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2);
 
 		switch (packet_type) {
 			case PacketType::Type3: {
 				const bool    sh_gx = (cmd_id & 0x2u) == 0;
 				const uint8_t op    = ((cmd_id >> 8u) & 0xffu);
 				const auto    r     = KYTY_PM4_R(cmd_id);
-				len                 = PacketSizeDw(cmd_id) - 1u;
+				len                 = ((cmd_id >> 16u) & 0x3fffu) + 1;
 
 				EXIT_NOT_IMPLEMENTED(len >= dw);
 

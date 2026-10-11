@@ -19,6 +19,14 @@ enum sys_file_cache_type_t {
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
+struct sys_file_find_t {
+	std::filesystem::path path_with_name;
+	SysFileTimeStruct     last_access_time;
+	SysFileTimeStruct     last_write_time;
+	uint64_t              size;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_dir_entry_t {
 	std::string name;
 	bool        is_file;
@@ -44,15 +52,17 @@ uint64_t    SysFileTell(sys_file_t& f);                    // NOLINT(google-runt
 bool        SysFileTruncate(sys_file_t& f, uint64_t size); // NOLINT(google-runtime-references)
 bool        SysFileUnlink(sys_file_t&                  f,
                           const std::filesystem::path& name); // NOLINT(google-runtime-references)
+void        SysFileWrite(uint32_t n, sys_file_t& f);          // NOLINT(google-runtime-references)
 uint64_t    SysFileSize(const std::filesystem::path& file_name);
-bool        SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size);
-bool        SysFileIsError(sys_file_t& f); // NOLINT(google-runtime-references)
-bool        SysFileIsDirectoryExisting(const std::filesystem::path& path);
-bool        SysFileIsFileExisting(const std::filesystem::path& name);
-bool        SysFileCreateDirectory(const std::filesystem::path& path);
-bool        SysFileDeleteDirectory(const std::filesystem::path& path);
-bool        SysFileDeleteFile(const std::filesystem::path& name);
-bool        SysFileFlush(sys_file_t& f); // NOLINT(google-runtime-references)
+// A file (its size) or a directory, in one query: false when there is none.
+bool              SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size);
+bool              SysFileIsError(sys_file_t& f); // NOLINT(google-runtime-references)
+bool              SysFileIsDirectoryExisting(const std::filesystem::path& path);
+bool              SysFileIsFileExisting(const std::filesystem::path& name);
+bool              SysFileCreateDirectory(const std::filesystem::path& path);
+bool              SysFileDeleteDirectory(const std::filesystem::path& path);
+bool              SysFileDeleteFile(const std::filesystem::path& name);
+bool              SysFileFlush(sys_file_t& f); // NOLINT(google-runtime-references)
 SysFileTimeStruct SysFileGetLastAccessTimeUtc(const std::filesystem::path& name);
 SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name);
 // NOLINTNEXTLINE(google-runtime-references)
@@ -67,6 +77,8 @@ bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeSt
 // NOLINTNEXTLINE(google-runtime-references)
 bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
                                          SysFileTimeStruct& access, SysFileTimeStruct& write);
+// NOLINTNEXTLINE(google-runtime-references)
+void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out);
 // NOLINTNEXTLINE(google-runtime-references)
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out);
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);

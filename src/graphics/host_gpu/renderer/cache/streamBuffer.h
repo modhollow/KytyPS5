@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -46,15 +47,17 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
-	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
-	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
+	[[nodiscard]] bool        HasDeviceAddress() const noexcept { return m_device_address != 0; }
+	[[nodiscard]] MemoryUsage Usage() const noexcept { return m_usage; }
+	[[nodiscard]] uint64_t    CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
-	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
+	[[nodiscard]] uint64_t          Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
+	void               Write(uint64_t offset, const void* source, uint64_t size);
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
@@ -66,12 +69,21 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
+	// A guest copy in a run of copies (CommandBuffer::CopyRunHandle: the run's barriers).
+	void CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
+	               uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
-	// BufferCache state lives directly on the resource.
-	bool   is_deleted   = false;
-	int    stream_score = 0;
-	size_t lru_id       = 0;
+	// BufferCache state lives directly on the resource (is_deleted also read by a speculative
+	// translation's thread).
+	std::atomic<bool> is_deleted {false};
+	int               stream_score = 0;
+	size_t            lru_id       = 0;
+	// The command buffer (CommandScheduler::CommandSerial) that last recorded a copy or fill into
+	// it or an image's bytes (TextureCache::DownloadImageData): writes that need not synchronize
+	// their pages first (a shader's write does, BufferCache::ObtainBuffer). Uploads into it then
+	// stay in order in that buffer (UploadPrologue).
+	uint64_t written_serial = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -82,27 +94,30 @@ private:
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
 
-	GraphicContext*               m_graphics    = nullptr;
-	CommandScheduler*             m_scheduler   = nullptr;
-	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
-	uint64_t                      m_cpu_address = 0;
-	vk::DeviceAddress             m_device_address = 0;
-	vk::Buffer                    m_buffer     = nullptr;
-	VmaAllocation                 m_allocation = nullptr;
-	uint64_t                      m_size;
-	bool                          m_coherent = false;
-	std::span<uint8_t>            m_mapped;
+	GraphicContext*    m_graphics       = nullptr;
+	CommandScheduler*  m_scheduler      = nullptr;
+	MemoryUsage        m_usage          = MemoryUsage::DeviceLocal;
+	uint64_t           m_cpu_address    = 0;
+	vk::DeviceAddress  m_device_address = 0;
+	vk::Buffer         m_buffer         = nullptr;
+	VmaAllocation      m_allocation     = nullptr;
+	uint64_t           m_size;
+	bool               m_coherent = false;
+	std::span<uint8_t> m_mapped;
 };
 
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, vk::BufferUsageFlags flags = AllFlags);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// What was fenced with `pending` (a speculative translation's work:
+	// CommandScheduler::PendingTick and up) gets `tick`.
+	void ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept;
 
 private:
 	friend struct StreamBufferTestAccess;

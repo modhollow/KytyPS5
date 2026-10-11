@@ -8,17 +8,20 @@
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
-	uint64_t addr = 0;
+	bool     operator==(const ColorBase&) const = default;
+	uint64_t addr                               = 0;
 };
 
 struct ColorView {
-	uint32_t base_array_slice_index = 0;
-	uint32_t last_array_slice_index = 0;
-	uint32_t current_mip_level      = 0;
+	bool     operator==(const ColorView&) const = default;
+	uint32_t base_array_slice_index             = 0;
+	uint32_t last_array_slice_index             = 0;
+	uint32_t current_mip_level                  = 0;
 };
 
 struct ColorInfo {
-	bool fmask_compression_enable = false;
+	bool operator==(const ColorInfo&) const = default;
+	bool fmask_compression_enable           = false;
 	// uint32_t fmask_compression_mode   = 0;
 	bool                    fmask_data_compression_disable = false;
 	bool                    fmask_one_frag_mode            = false;
@@ -33,26 +36,30 @@ struct ColorInfo {
 };
 
 struct ColorAttrib {
-	bool     force_dest_alpha_to_one = false;
-	uint32_t num_samples             = 0;
-	uint32_t num_fragments           = 0;
+	bool     operator==(const ColorAttrib&) const = default;
+	bool     force_dest_alpha_to_one              = false;
+	uint32_t num_samples                          = 0;
+	uint32_t num_fragments                        = 0;
 };
 
 struct ColorAttrib2 {
-	uint32_t height         = 0;
-	uint32_t width          = 0;
-	uint32_t num_mip_levels = 0;
+	bool     operator==(const ColorAttrib2&) const = default;
+	uint32_t height                                = 0;
+	uint32_t width                                 = 0;
+	uint32_t num_mip_levels                        = 0;
 };
 
 struct ColorAttrib3 {
-	uint32_t           depth                        = 0;
-	Prospero::TileMode tile_mode                    = Prospero::TileMode::kRenderTarget;
-	uint32_t           dimension                    = 0;
-	bool               metadata_pipe_aligned        = false;
-	bool               write_vrs_rate_hint_to_cmask = false;
+	bool               operator==(const ColorAttrib3&) const = default;
+	uint32_t           depth                                 = 0;
+	Prospero::TileMode tile_mode                             = Prospero::TileMode::kRenderTarget;
+	uint32_t           dimension                             = 0;
+	bool               metadata_pipe_aligned                 = false;
+	bool               write_vrs_rate_hint_to_cmask          = false;
 };
 
 struct ColorDccControl {
+	bool operator==(const ColorDccControl&) const = default;
 	enum class IndependentBlockSize : uint8_t { Disabled, Bytes64, Bytes128 };
 
 	uint32_t             max_uncompressed_block_size    = 2;
@@ -65,26 +72,32 @@ struct ColorDccControl {
 };
 
 struct ColorCmask {
-	uint64_t addr = 0;
+	bool     operator==(const ColorCmask&) const = default;
+	uint64_t addr                                = 0;
 };
 
 struct ColorFmask {
-	uint64_t addr = 0;
+	bool     operator==(const ColorFmask&) const = default;
+	uint64_t addr                                = 0;
 };
 
 struct ColorClearWord0 {
-	uint32_t word0 = 0;
+	bool     operator==(const ColorClearWord0&) const = default;
+	uint32_t word0                                    = 0;
 };
 
 struct ColorClearWord1 {
-	uint32_t word1 = 0;
+	bool     operator==(const ColorClearWord1&) const = default;
+	uint32_t word1                                    = 0;
 };
 
 struct ColorDccAddr {
-	uint64_t addr = 0;
+	bool     operator==(const ColorDccAddr&) const = default;
+	uint64_t addr                                  = 0;
 };
 
 struct RenderTarget {
+	bool            operator==(const RenderTarget&) const = default;
 	ColorBase       base;
 	ColorView       view;
 	ColorInfo       info;
@@ -100,6 +113,7 @@ struct RenderTarget {
 };
 
 struct DepthZInfo {
+	bool                                        operator==(const DepthZInfo&) const = default;
 	Prospero::DepthFormat                       format      = Prospero::DepthFormat::kInvalid;
 	uint32_t                                    num_samples = 0;
 	Prospero::TextureCompatiblePlaneCompression texture_compatibility =
@@ -135,6 +149,7 @@ struct DepthZInfo {
 };
 
 struct DepthStencilInfo {
+	bool                               operator==(const DepthStencilInfo&) const = default;
 	Prospero::StencilFormat            format = Prospero::StencilFormat::kInvalid;
 	Prospero::TextureCompatibleStencil texture_compatibility =
 	    Prospero::TextureCompatibleStencil::kDisable;
@@ -163,20 +178,23 @@ struct DepthStencilInfo {
 };
 
 struct DepthDepthView {
-	uint32_t slice_start           = 0;
-	uint32_t slice_max             = 0;
-	uint8_t  current_mip_level     = 0;
-	bool     depth_write_disable   = false;
-	bool     stencil_write_disable = false;
+	bool     operator==(const DepthDepthView&) const = default;
+	uint32_t slice_start                             = 0;
+	uint32_t slice_max                               = 0;
+	uint8_t  current_mip_level                       = 0;
+	bool     depth_write_disable                     = false;
+	bool     stencil_write_disable                   = false;
 };
 
 struct DepthDepthSizeXY {
-	uint16_t x_max = 0;
-	uint16_t y_max = 0;
-	bool     valid = false;
+	bool     operator==(const DepthDepthSizeXY&) const = default;
+	uint16_t x_max                                     = 0;
+	uint16_t y_max                                     = 0;
+	bool     valid                                     = false;
 };
 
 struct DepthRenderTarget {
+	bool             operator==(const DepthRenderTarget&) const = default;
 	DepthZInfo       z_info;
 	DepthStencilInfo stencil_info;
 	DepthDepthView   depth_view;
@@ -191,27 +209,30 @@ struct DepthRenderTarget {
 };
 
 struct RenderControl {
-	bool    depth_clear_enable       = false;
-	bool    stencil_clear_enable     = false;
-	bool    resummarize_enable       = false;
-	bool    stencil_compress_disable = false;
-	bool    depth_compress_disable   = false;
-	bool    copy_depth_to_color      = false;
-	bool    copy_stencil_to_color    = false;
-	bool    copy_centroid            = false;
-	uint8_t copy_sample              = 0;
+	bool    operator==(const RenderControl&) const = default;
+	bool    depth_clear_enable                     = false;
+	bool    stencil_clear_enable                   = false;
+	bool    resummarize_enable                     = false;
+	bool    stencil_compress_disable               = false;
+	bool    depth_compress_disable                 = false;
+	bool    copy_depth_to_color                    = false;
+	bool    copy_stencil_to_color                  = false;
+	bool    copy_centroid                          = false;
+	uint8_t copy_sample                            = 0;
 };
 
 struct DepthRenderOverride {
-	bool force_z_valid       = false;
-	bool force_z_dirty       = false;
-	bool force_stencil_valid = false;
-	bool force_stencil_dirty = false;
+	bool operator==(const DepthRenderOverride&) const = default;
+	bool force_z_valid                                = false;
+	bool force_z_dirty                                = false;
+	bool force_stencil_valid                          = false;
+	bool force_stencil_dirty                          = false;
 };
 
 struct GdsOaCounter {
-	uint32_t counter = 0;
-	uint32_t address = 0;
+	bool     operator==(const GdsOaCounter&) const = default;
+	uint32_t counter                               = 0;
+	uint32_t address                               = 0;
 
 	[[nodiscard]] uint32_t GetSpaceAvailable() const { return counter; }
 	[[nodiscard]] uint32_t GetAddressBytes() const { return address & 0x0000ffffu; }
@@ -222,7 +243,8 @@ struct GdsOaCounter {
 };
 
 struct GdsOaState {
-	static constexpr uint32_t COUNTERS_NUM = 8;
+	bool                      operator==(const GdsOaState&) const = default;
+	static constexpr uint32_t COUNTERS_NUM                        = 8;
 
 	uint32_t     cntl = 0;
 	GdsOaCounter counters[COUNTERS_NUM];
@@ -231,142 +253,157 @@ struct GdsOaState {
 };
 
 struct ClipControl {
-	uint8_t user_clip_planes                    = 0;
-	uint8_t user_clip_plane_mode                = 0;
-	bool    dx_clip_space                       = false;
-	bool    vertex_kill_any                     = false;
-	bool    min_z_clip_disable                  = false;
-	bool    max_z_clip_disable                  = false;
-	bool    user_clip_plane_negate_y            = false;
-	bool    clip_disable                        = false;
-	bool    user_clip_plane_cull_only           = false;
-	bool    cull_on_clipping_error_disable      = false;
-	bool    linear_attribute_clip_enable        = false;
-	bool    force_viewport_index_from_vs_enable = false;
+	bool    operator==(const ClipControl&) const = default;
+	uint8_t user_clip_planes                     = 0;
+	uint8_t user_clip_plane_mode                 = 0;
+	bool    dx_clip_space                        = false;
+	bool    vertex_kill_any                      = false;
+	bool    min_z_clip_disable                   = false;
+	bool    max_z_clip_disable                   = false;
+	bool    user_clip_plane_negate_y             = false;
+	bool    clip_disable                         = false;
+	bool    user_clip_plane_cull_only            = false;
+	bool    cull_on_clipping_error_disable       = false;
+	bool    linear_attribute_clip_enable         = false;
+	bool    force_viewport_index_from_vs_enable  = false;
 
 	[[nodiscard]] bool IsZClipEnabled() const { return !min_z_clip_disable && !max_z_clip_disable; }
 };
 
 struct DepthControl {
-	bool    stencil_enable      = false;
-	bool    z_enable            = false;
-	bool    z_write_enable      = false;
-	bool    depth_bounds_enable = false;
-	uint8_t zfunc               = 0;
-	bool    backface_enable     = false;
-	uint8_t stencilfunc         = 0;
-	uint8_t stencilfunc_bf      = 0;
+	bool    operator==(const DepthControl&) const = default;
+	bool    stencil_enable                        = false;
+	bool    z_enable                              = false;
+	bool    z_write_enable                        = false;
+	bool    depth_bounds_enable                   = false;
+	uint8_t zfunc                                 = 0;
+	bool    backface_enable                       = false;
+	uint8_t stencilfunc                           = 0;
+	uint8_t stencilfunc_bf                        = 0;
 };
 
 struct StencilControl {
-	uint8_t stencil_fail     = 0;
-	uint8_t stencil_zpass    = 0;
-	uint8_t stencil_zfail    = 0;
-	uint8_t stencil_fail_bf  = 0;
-	uint8_t stencil_zpass_bf = 0;
-	uint8_t stencil_zfail_bf = 0;
+	bool    operator==(const StencilControl&) const = default;
+	uint8_t stencil_fail                            = 0;
+	uint8_t stencil_zpass                           = 0;
+	uint8_t stencil_zfail                           = 0;
+	uint8_t stencil_fail_bf                         = 0;
+	uint8_t stencil_zpass_bf                        = 0;
+	uint8_t stencil_zfail_bf                        = 0;
 };
 
 struct StencilMask {
-	uint8_t stencil_testval      = 0;
-	uint8_t stencil_mask         = 0;
-	uint8_t stencil_writemask    = 0;
-	uint8_t stencil_opval        = 0;
-	uint8_t stencil_testval_bf   = 0;
-	uint8_t stencil_mask_bf      = 0;
-	uint8_t stencil_writemask_bf = 0;
-	uint8_t stencil_opval_bf     = 0;
+	bool    operator==(const StencilMask&) const = default;
+	uint8_t stencil_testval                      = 0;
+	uint8_t stencil_mask                         = 0;
+	uint8_t stencil_writemask                    = 0;
+	uint8_t stencil_opval                        = 0;
+	uint8_t stencil_testval_bf                   = 0;
+	uint8_t stencil_mask_bf                      = 0;
+	uint8_t stencil_writemask_bf                 = 0;
+	uint8_t stencil_opval_bf                     = 0;
 };
 
 struct ModeControl {
-	bool    cull_front               = false;
-	bool    cull_back                = false;
-	bool    face                     = false;
-	uint8_t poly_mode                = 0;
-	uint8_t polymode_front_ptype     = 0;
-	uint8_t polymode_back_ptype      = 0;
-	bool    poly_offset_front_enable = false;
-	bool    poly_offset_back_enable  = false;
-	bool    vtx_window_offset_enable = false;
-	bool    provoking_vtx_last       = false;
-	bool    persp_corr_dis           = false;
+	bool    operator==(const ModeControl&) const = default;
+	bool    cull_front                           = false;
+	bool    cull_back                            = false;
+	bool    face                                 = false;
+	uint8_t poly_mode                            = 0;
+	uint8_t polymode_front_ptype                 = 0;
+	uint8_t polymode_back_ptype                  = 0;
+	bool    poly_offset_front_enable             = false;
+	bool    poly_offset_back_enable              = false;
+	bool    vtx_window_offset_enable             = false;
+	bool    provoking_vtx_last                   = false;
+	bool    persp_corr_dis                       = false;
 };
 
 struct PolyOffset {
-	int8_t neg_num_db_bits = -23;
-	bool   db_is_float_fmt = true;
-	float  clamp           = 0.0f;
-	float  front_scale     = 0.0f;
-	float  front_offset    = 0.0f;
-	float  back_scale      = 0.0f;
-	float  back_offset     = 0.0f;
+	bool   operator==(const PolyOffset&) const = default;
+	int8_t neg_num_db_bits                     = -23;
+	bool   db_is_float_fmt                     = true;
+	float  clamp                               = 0.0f;
+	float  front_scale                         = 0.0f;
+	float  front_offset                        = 0.0f;
+	float  back_scale                          = 0.0f;
+	float  back_offset                         = 0.0f;
 };
 
 struct BlendControl {
-	uint8_t color_srcblend       = 1;
-	uint8_t color_comb_fcn       = 0;
-	uint8_t color_destblend      = 0;
-	uint8_t alpha_srcblend       = 1;
-	uint8_t alpha_comb_fcn       = 0;
-	uint8_t alpha_destblend      = 0;
-	bool    separate_alpha_blend = true;
-	bool    enable               = false;
+	bool    operator==(const BlendControl&) const = default;
+	uint8_t color_srcblend                        = 1;
+	uint8_t color_comb_fcn                        = 0;
+	uint8_t color_destblend                       = 0;
+	uint8_t alpha_srcblend                        = 1;
+	uint8_t alpha_comb_fcn                        = 0;
+	uint8_t alpha_destblend                       = 0;
+	bool    separate_alpha_blend                  = true;
+	bool    enable                                = false;
 };
 
 struct BlendColor {
-	float red   = 0.0f;
-	float green = 0.0f;
-	float blue  = 0.0f;
-	float alpha = 0.0f;
+	bool  operator==(const BlendColor&) const = default;
+	float red                                 = 0.0f;
+	float green                               = 0.0f;
+	float blue                                = 0.0f;
+	float alpha                               = 0.0f;
 };
 
 struct EqaaControl {
-	uint8_t max_anchor_samples         = 0;
-	uint8_t ps_iter_samples            = 0;
-	uint8_t mask_export_num_samples    = 0;
-	uint8_t alpha_to_mask_num_samples  = 0;
-	bool    high_quality_intersections = false;
-	bool    incoherent_eqaa_reads      = false;
-	bool    interpolate_comp_z         = false;
-	bool    static_anchor_associations = false;
+	bool    operator==(const EqaaControl&) const = default;
+	uint8_t max_anchor_samples                   = 0;
+	uint8_t ps_iter_samples                      = 0;
+	uint8_t mask_export_num_samples              = 0;
+	uint8_t alpha_to_mask_num_samples            = 0;
+	bool    high_quality_intersections           = false;
+	bool    incoherent_eqaa_reads                = false;
+	bool    interpolate_comp_z                   = false;
+	bool    static_anchor_associations           = false;
 };
 
 struct ColorControl {
-	uint8_t mode = 1;
-	uint8_t op   = 0xCC;
+	bool    operator==(const ColorControl&) const = default;
+	uint8_t mode                                  = 1;
+	uint8_t op                                    = 0xCC;
 };
 
 struct ScanModeControl {
-	bool msaa_enable          = false;
-	bool vport_scissor_enable = true;
-	bool line_stipple_enable  = false;
+	bool operator==(const ScanModeControl&) const = default;
+	bool msaa_enable                              = false;
+	bool vport_scissor_enable                     = true;
+	bool line_stipple_enable                      = false;
 };
 
 struct AaSampleControl {
-	uint64_t centroid_priority = 0;
-	uint32_t locations[16]     = {};
+	bool     operator==(const AaSampleControl&) const = default;
+	uint64_t centroid_priority                        = 0;
+	uint32_t locations[16]                            = {};
 };
 
 struct DepthShaderControl {
-	uint32_t other_bits                  = 0;
-	uint8_t  conservative_z_export_value = 0;
-	uint8_t  shader_z_behavior           = 0;
-	bool     shader_kill_enable          = false;
-	bool     shader_z_export_enable      = false;
-	bool     shader_mask_export_enable   = false;
-	bool     shader_dual_export_enable   = false;
-	bool     shader_execute_on_noop      = false;
-	bool     alpha_to_mask_disable       = false;
+	bool     operator==(const DepthShaderControl&) const = default;
+	uint32_t other_bits                                  = 0;
+	uint8_t  conservative_z_export_value                 = 0;
+	uint8_t  shader_z_behavior                           = 0;
+	bool     shader_kill_enable                          = false;
+	bool     shader_z_export_enable                      = false;
+	bool     shader_mask_export_enable                   = false;
+	bool     shader_dual_export_enable                   = false;
+	bool     shader_execute_on_noop                      = false;
+	bool     alpha_to_mask_disable                       = false;
 };
 
 struct AaConfig {
-	uint8_t msaa_num_samples      = 0;
-	bool    aa_mask_centroid_dtmn = false;
-	uint8_t max_sample_dist       = 0;
-	uint8_t msaa_exposed_samples  = 0;
+	bool    operator==(const AaConfig&) const = default;
+	uint8_t msaa_num_samples                  = 0;
+	bool    aa_mask_centroid_dtmn             = false;
+	uint8_t max_sample_dist                   = 0;
+	uint8_t msaa_exposed_samples              = 0;
 };
 
 struct Viewport {
+	bool  operator==(const Viewport&) const     = default;
 	float zmin                                  = 0.0f;
 	float zmax                                  = 0.0f;
 	float xscale                                = 1.0f;
@@ -383,6 +420,7 @@ struct Viewport {
 };
 
 struct ScreenViewport {
+	bool     operator==(const ScreenViewport&) const = default;
 	Viewport viewports[16];
 	uint32_t transform_control                    = 1087;
 	int      screen_scissor_left                  = 0;
@@ -416,56 +454,59 @@ struct ScreenViewport {
 };
 
 struct HsShaderResource1 {
-	uint8_t vgprs                     = 0;
-	uint8_t priority                  = 0;
-	uint8_t float_mode                = 0;
-	bool    dx10_clamp                = false;
-	bool    debug_mode                = false;
-	bool    ieee_mode                 = false;
-	bool    require_forward_progress  = false;
-	bool    threadgroup_configuration = false;
-	uint8_t ls_vgpr_component_count   = 0;
-	bool    fp16_overflow             = false;
+	bool    operator==(const HsShaderResource1&) const = default;
+	uint8_t vgprs                                      = 0;
+	uint8_t priority                                   = 0;
+	uint8_t float_mode                                 = 0;
+	bool    dx10_clamp                                 = false;
+	bool    debug_mode                                 = false;
+	bool    ieee_mode                                  = false;
+	bool    require_forward_progress                   = false;
+	bool    threadgroup_configuration                  = false;
+	uint8_t ls_vgpr_component_count                    = 0;
+	bool    fp16_overflow                              = false;
 };
 
 struct HsShaderResource2 {
-	bool     scratch_en   = false;
-	uint8_t  user_sgpr    = 0;
-	uint16_t lds_size     = 0;
-	uint8_t  shared_vgprs = 0;
+	bool     operator==(const HsShaderResource2&) const = default;
+	bool     scratch_en                                 = false;
+	uint8_t  user_sgpr                                  = 0;
+	uint16_t lds_size                                   = 0;
+	uint8_t  shared_vgprs                               = 0;
 };
 
 struct PsShaderResource1 {
-	uint8_t vgprs                    = 0;
-	uint8_t priority                 = 0;
-	uint8_t float_mode               = 0;
-	bool    dx10_clamp               = false;
-	bool    debug_mode               = false;
-	bool    ieee_mode                = false;
-	bool    cu_group_disable         = false;
-	bool    require_forward_progress = false;
-	bool    fp16_overflow            = false;
+	bool    operator==(const PsShaderResource1&) const = default;
+	uint8_t vgprs                                      = 0;
+	uint8_t priority                                   = 0;
+	uint8_t float_mode                                 = 0;
+	bool    dx10_clamp                                 = false;
+	bool    debug_mode                                 = false;
+	bool    ieee_mode                                  = false;
+	bool    cu_group_disable                           = false;
+	bool    require_forward_progress                   = false;
+	bool    fp16_overflow                              = false;
 };
 
 struct PsShaderResource2 {
-	bool    scratch_en             = false;
-	uint8_t user_sgpr              = 0;
-	bool    wave_cnt_en            = false;
-	uint8_t extra_lds_size         = 0;
-	uint8_t raster_ordered_shading = 0;
-	uint8_t shared_vgprs           = 0;
+	bool    operator==(const PsShaderResource2&) const = default;
+	bool    scratch_en                                 = false;
+	uint8_t user_sgpr                                  = 0;
+	bool    wave_cnt_en                                = false;
+	uint8_t extra_lds_size                             = 0;
+	uint8_t raster_ordered_shading                     = 0;
+	uint8_t shared_vgprs                               = 0;
 };
 
 struct PsStageRegisters {
-	uint64_t          data_addr = 0;
-	uint64_t          user_data_addr = 0;
-	// Hades II uses PS offsets 4:5 for a byte-addressed descriptor table.
-	uint64_t          auxiliary_table_addr = 0;
+	bool              operator==(const PsStageRegisters&) const = default;
+	uint64_t          data_addr                                 = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
 };
 
 struct CsStageRegisters {
+	bool operator==(const CsStageRegisters&) const = default;
 
 	uint64_t data_addr                 = 0;
 	uint32_t num_thread_x              = 0;
@@ -493,54 +534,60 @@ struct CsStageRegisters {
 };
 
 struct EsStageRegisters {
-	uint64_t data_addr = 0;
+	bool     operator==(const EsStageRegisters&) const = default;
+	uint64_t data_addr                                 = 0;
 };
 
 struct LsStageRegisters {
-	uint64_t data_addr = 0;
+	bool     operator==(const LsStageRegisters&) const = default;
+	uint64_t data_addr                                 = 0;
 };
 
 struct HsStageRegisters {
-	uint64_t          data_addr      = 0;
-	uint64_t          user_data_addr = 0;
+	bool              operator==(const HsStageRegisters&) const = default;
+	uint64_t          data_addr                                 = 0;
 	HsShaderResource1 rsrc1;
 	HsShaderResource2 rsrc2;
 };
 
 struct GsShaderResource1 {
-	uint8_t vgprs                     = 0;
-	uint8_t priority                  = 0;
-	uint8_t float_mode                = 0;
-	bool    dx10_clamp                = false;
-	bool    debug_mode                = false;
-	bool    ieee_mode                 = false;
-	bool    cu_group_enable           = false;
-	bool    require_forward_progress  = false;
-	bool    threadgroup_configuration = false;
-	uint8_t gs_vgpr_component_count   = 0;
-	bool    fp16_overflow             = false;
+	bool    operator==(const GsShaderResource1&) const = default;
+	uint8_t vgprs                                      = 0;
+	uint8_t priority                                   = 0;
+	uint8_t float_mode                                 = 0;
+	bool    dx10_clamp                                 = false;
+	bool    debug_mode                                 = false;
+	bool    ieee_mode                                  = false;
+	bool    cu_group_enable                            = false;
+	bool    require_forward_progress                   = false;
+	bool    threadgroup_configuration                  = false;
+	uint8_t gs_vgpr_component_count                    = 0;
+	bool    fp16_overflow                              = false;
 };
 
 struct GsShaderResource2 {
-	bool    scratch_en              = false;
-	uint8_t user_sgpr               = 0;
-	uint8_t es_vgpr_component_count = 0;
-	bool    offchip_lds             = false;
-	uint8_t lds_size                = 0;
-	uint8_t shared_vgprs            = 0;
+	bool    operator==(const GsShaderResource2&) const = default;
+	bool    scratch_en                                 = false;
+	uint8_t user_sgpr                                  = 0;
+	uint8_t es_vgpr_component_count                    = 0;
+	bool    offchip_lds                                = false;
+	uint8_t lds_size                                   = 0;
+	uint8_t shared_vgprs                               = 0;
 };
 
 struct GsStageRegisters {
-	uint64_t          data_addr      = 0;
-	uint64_t          user_data_addr = 0;
+	bool              operator==(const GsStageRegisters&) const = default;
+	uint64_t          data_addr                                 = 0;
+	uint64_t          user_data_addr                            = 0;
 	GsShaderResource1 rsrc1;
 	GsShaderResource2 rsrc2;
 };
 
 struct ShaderRegisters {
-	uint32_t m_spiVsOutConfig     = 0;
-	uint32_t m_spiShaderPosFormat = 0;
-	uint32_t m_paClVsOutCntl      = 0;
+	bool     operator==(const ShaderRegisters&) const = default;
+	uint32_t m_spiVsOutConfig                         = 0;
+	uint32_t m_spiShaderPosFormat                     = 0;
+	uint32_t m_paClVsOutCntl                          = 0;
 
 	uint32_t ps_interpolator_settings[32] = {0};
 	// uint32_t ps_input_num                 = 0;
@@ -590,7 +637,8 @@ struct ShaderRegisters {
 enum class UserSgprType { Unknown, Region, Vsharp };
 
 struct UserSgprInfo {
-	static constexpr int SGPRS_MAX = 32;
+	bool                 operator==(const UserSgprInfo&) const = default;
+	static constexpr int SGPRS_MAX                             = 32;
 
 	uint32_t     value[SGPRS_MAX] = {0};
 	UserSgprType type[SGPRS_MAX]  = {};
@@ -598,33 +646,41 @@ struct UserSgprInfo {
 };
 
 struct VertexShaderInfo {
+	bool             operator==(const VertexShaderInfo&) const = default;
 	EsStageRegisters es_regs;
 	LsStageRegisters ls_regs;
 	HsStageRegisters hs_regs;
 	GsStageRegisters gs_regs;
 	UserSgprInfo     hs_user_sgpr;
 	UserSgprInfo     gs_user_sgpr;
+	// The GS user SGPR the CP writes the draw's start instance into: an indirect draw's
+	// START_INST_LOC (-1: none).
+	int32_t start_instance_user_sgpr = -1;
 };
 
 struct PixelShaderInfo {
+	bool             operator==(const PixelShaderInfo&) const = default;
 	PsStageRegisters ps_regs;
 	UserSgprInfo     ps_user_sgpr;
 };
 
 struct ComputeShaderInfo {
+	bool             operator==(const ComputeShaderInfo&) const = default;
 	CsStageRegisters cs_regs;
 	UserSgprInfo     cs_user_sgpr;
 };
 
 struct GeControl {
-	uint16_t primitive_group_size = 0;
-	uint16_t vertex_group_size    = 0;
+	bool     operator==(const GeControl&) const = default;
+	uint16_t primitive_group_size               = 0;
+	uint16_t vertex_group_size                  = 0;
 };
 
 struct GeUserVgprEn {
-	bool vgpr1 = false;
-	bool vgpr2 = false;
-	bool vgpr3 = false;
+	bool operator==(const GeUserVgprEn&) const = default;
+	bool vgpr1                                 = false;
+	bool vgpr2                                 = false;
+	bool vgpr3                                 = false;
 };
 
 class Context {
@@ -633,6 +689,7 @@ public:
 	~Context() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(Context);
+	bool operator==(const Context&) const = default;
 
 	void Reset() { *this = Context(); }
 
@@ -939,18 +996,13 @@ private:
 	ShaderRegisters m_sh_regs;
 };
 
-struct FsrView {
-	uint32_t control_points[2][4] {};
-	uint32_t alphas[2][2] {};
-	uint32_t window[2] {};
-};
-
 class UserConfig {
 public:
 	UserConfig()  = default;
 	~UserConfig() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(UserConfig);
+	bool operator==(const UserConfig&) const = default;
 
 	void Reset() { *this = UserConfig(); }
 
@@ -974,17 +1026,8 @@ public:
 	void SetGdsOaCntl(uint32_t value) { m_gds_oa.cntl = value; }
 	void SetGdsOaCounter(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].counter = value; }
 	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
-	void SetFsrControlPoint(uint32_t axis, uint32_t index, uint32_t value) {
-		m_fsr_view.control_points[axis][index] = value;
-	}
-	void SetFsrAlpha(uint32_t axis, uint32_t index, uint32_t value) {
-		m_fsr_view.alphas[axis][index] = value;
-	}
-	void SetFsrWindow(uint32_t index, uint32_t value) { m_fsr_view.window[index] = value; }
-	[[nodiscard]] const FsrView& GetFsrView() const { return m_fsr_view; }
 
 private:
-	FsrView m_fsr_view;
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
 	uint32_t                m_object_id               = 0;
@@ -1001,31 +1044,26 @@ public:
 	~Shader() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(Shader);
+	bool operator==(const Shader&) const = default;
 
 	void Reset() { *this = Shader(); }
 
 	void SetEsShaderBase(uint64_t addr) { m_vs.es_regs.data_addr = addr; }
 	void SetLsShaderBase(uint64_t addr) { m_vs.ls_regs.data_addr = addr; }
 	void SetHsShaderBase(uint64_t addr) { m_vs.hs_regs.data_addr = addr; }
-	void SetHsUserDataAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_vs.hs_regs.user_data_addr, word, value);
-	}
 	void SetHsShaderResource1(const HsShaderResource1& rsrc1) { m_vs.hs_regs.rsrc1 = rsrc1; }
 	void SetHsShaderResource2(const HsShaderResource2& rsrc2) { m_vs.hs_regs.rsrc2 = rsrc2; }
 	void SetGsShaderBase(uint64_t addr) { m_vs.gs_regs.data_addr = addr; }
 	void SetGsUserDataAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_vs.gs_regs.user_data_addr, word, value);
+		const auto shift   = word * 32u;
+		auto&      address = m_vs.gs_regs.user_data_addr;
+		address            = (address & ~(uint64_t {0xffffffffu} << shift)) |
+		                     (static_cast<uint64_t>(value) << shift);
 	}
 	void SetGsShaderResource1(const GsShaderResource1& rsrc1) { m_vs.gs_regs.rsrc1 = rsrc1; }
 	void SetGsShaderResource2(const GsShaderResource2& rsrc2) { m_vs.gs_regs.rsrc2 = rsrc2; }
 
 	void SetPsShaderBase(uint64_t addr) { m_ps.ps_regs.data_addr = addr; }
-	void SetPsUserDataAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_ps.ps_regs.user_data_addr, word, value);
-	}
-	void SetPsAuxiliaryTableAddress(uint32_t word, uint32_t value) {
-		SetUserDataAddressWord(m_ps.ps_regs.auxiliary_table_addr, word, value);
-	}
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
 
@@ -1056,18 +1094,13 @@ public:
 		m_vs.gs_user_sgpr.count =
 		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
 	}
+	void SetStartInstanceUserSgpr(int32_t id) { m_vs.start_instance_user_sgpr = id; }
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }
 	[[nodiscard]] const ComputeShaderInfo& GetCs() const { return m_cs; }
 
 private:
-	static void SetUserDataAddressWord(uint64_t& address, uint32_t word, uint32_t value) {
-		const auto shift = word * 32u;
-		address = (address & ~(uint64_t {0xffffffffu} << shift)) |
-		          (static_cast<uint64_t>(value) << shift);
-	}
-
 	VertexShaderInfo  m_vs;
 	PixelShaderInfo   m_ps;
 	ComputeShaderInfo m_cs;

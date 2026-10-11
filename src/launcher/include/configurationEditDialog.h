@@ -1,6 +1,8 @@
 #ifndef CONFIGURATION_EDIT_DIALOG_H
 #define CONFIGURATION_EDIT_DIALOG_H
 
+#include "common.h"
+
 #include <QDialog>
 #include <QString>
 #include <QStringList>
@@ -20,6 +22,7 @@ class ConfigurationEditDialog;
 
 class ConfigurationEditDialog: public QDialog {
 	Q_OBJECT
+	KYTY_QT_CLASS_NO_COPY(ConfigurationEditDialog);
 
 public:
 	explicit ConfigurationEditDialog(Configuration& info, QWidget* parent = nullptr);
@@ -28,13 +31,9 @@ public:
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
 
-	void                      SetGlobalSettings(const QStringList& dirs);
+	void                      SetTitle(const QString& str);
+	void                      SetGameDirectories(const QStringList& dirs);
 	[[nodiscard]] QStringList GetGameDirectories() const;
-
-signals:
-	void PreviewControllerColor(const QString& color);
-	void ImportGameSettings();
-	void ExportGameSettings();
 
 private:
 	Ui::ConfigurationEditDialog* m_ui = nullptr;
@@ -42,7 +41,7 @@ private:
 	QGroupBox*                   m_game_dirs_group        = nullptr;
 	QListWidget*                 m_game_dirs_list         = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
-	bool                         m_global_settings        = false;
+	bool                         m_show_game_dirs         = false;
 
 protected:
 	void Init(const Configuration& info);
@@ -56,6 +55,8 @@ protected:
 
 	/*slots:*/
 
+	void update_info();
+	void adjust_size();
 	void save();
 	void clear();
 	void add_game_directory();

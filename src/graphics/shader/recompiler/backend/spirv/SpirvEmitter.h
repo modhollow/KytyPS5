@@ -9,9 +9,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-// Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
-std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword = 0);
+void AnalyzeProgramRequirements(IR::Program& program);
+
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

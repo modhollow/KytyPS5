@@ -92,11 +92,6 @@ public:
 	[[nodiscard]] bool Initialize() {
 		const AVCodec* decoder = avcodec_find_decoder(GetAvCodecId(m_config.codec_type));
 		if (decoder == nullptr) {
-			if (m_config.codec_type == CODEC_TYPE_VP9) {
-				Log::WriteToConsoleAndLog(
-				    "WARNING: Videodec2: The game requested VP9 video, but FFmpeg has no VP9 "
-				    "decoder. Use FFmpeg with VP9 decoding enabled.\n");
-			}
 			LOGF("Videodec2: FFmpeg decoder is unavailable for codec type %u\n",
 			     m_config.codec_type);
 			return false;
@@ -347,8 +342,8 @@ private:
 	}
 
 	Config                    m_config;
-	AVCodecContext*           m_codec    = nullptr;
-	SwsContext*               m_sws      = nullptr;
+	AVCodecContext*           m_codec = nullptr;
+	SwsContext*               m_sws   = nullptr;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };

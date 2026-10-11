@@ -1,7 +1,12 @@
 #include "graphics/presentation/window/hostInput.h"
 
-#include <SDL3/SDL.h>
-
+#include "SDL_error.h"
+#include "SDL_events.h"
+#include "SDL_keyboard.h"
+#include "SDL_keycode.h"
+#include "SDL_mouse.h"
+#include "SDL_timer.h"
+#include "SDL_video.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -25,8 +30,6 @@ struct ControlInfo {
 	Controller::Axis axis     = Controller::Axis::AxisMax;
 	bool             positive = false;
 	float            touch_x  = 0.0f;
-
-	Controller::Setting setting {};
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -57,10 +60,6 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {"RightStickRight", 0, Controller::Axis::RightX, true},
     ControlInfo {"RightStickUp", 0, Controller::Axis::RightY, false},
     ControlInfo {"RightStickDown", 0, Controller::Axis::RightY, true},
-    ControlInfo {.name = "SpeakerVolume", .setting = Controller::Setting::SpeakerVolume},
-    ControlInfo {.name = "VibrationIntensity", .setting = Controller::Setting::VibrationIntensity},
-    ControlInfo {.name    = "TriggerEffectIntensity",
-                 .setting = Controller::Setting::TriggerEffectIntensity},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
@@ -72,7 +71,6 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
-constexpr uint64_t         CURSOR_IDLE_HIDE_MS    = 2000;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
@@ -82,8 +80,6 @@ struct MouseJoystickState {
 };
 
 MouseJoystickState g_mouse;
-SDL_Window*        g_mouse_window   = nullptr;
-uint64_t           g_cursor_hide_at = 0;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -145,8 +141,9 @@ public:
 				}
 			}
 
-			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
-			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
+			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_SPACE ||
+			                      binding.key == SDLK_F1 || binding.key == SDLK_F7 ||
+			                      binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -217,14 +214,12 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDLK_J: return Controller::PAD_BUTTON_CROSS;
-		case SDLK_I: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDLK_K: return Controller::PAD_BUTTON_SQUARE;
-		case SDLK_L: return Controller::PAD_BUTTON_CIRCLE;
-		case SDLK_Q: return Controller::PAD_BUTTON_L1;
-		case SDLK_E: return Controller::PAD_BUTTON_R1;
-		case SDLK_Z: return Controller::PAD_BUTTON_L2;
-		case SDLK_C: return Controller::PAD_BUTTON_R2;
+		case SDLK_j: return Controller::PAD_BUTTON_CROSS;
+		case SDLK_i: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDLK_k: return Controller::PAD_BUTTON_SQUARE;
+		case SDLK_l: return Controller::PAD_BUTTON_CIRCLE;
+		case SDLK_q: return Controller::PAD_BUTTON_L1;
+		case SDLK_e: return Controller::PAD_BUTTON_R1;
 		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
 		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
 		case SDLK_RETURN:
@@ -250,12 +245,6 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
-void CycleSettingOnPress(Controller::Setting setting, bool down) {
-	if (down) {
-		Controller::CycleSetting(setting);
-	}
-}
-
 void SetControl(std::size_t control, bool down) {
 	if (control == INVALID_CONTROL) {
 		return;
@@ -268,10 +257,6 @@ void SetControl(std::size_t control, bool down) {
 	}
 	if (info.button != 0) {
 		SetButton(info.button, down);
-		return;
-	}
-	if (info.axis == Controller::Axis::AxisMax) {
-		CycleSettingOnPress(info.setting, down);
 		return;
 	}
 
@@ -298,38 +283,35 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
 		case SDLK_TAB: SetTouchPad(0.75f, down); return;
-		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
-		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
-		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
-		case SDLK_A:
+		case SDLK_a:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
 			return;
-		case SDLK_D:
+		case SDLK_d:
 			left.right = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
 			return;
-		case SDLK_W:
+		case SDLK_w:
 			left.up = down;
 			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
 			return;
-		case SDLK_S:
+		case SDLK_s:
 			left.down = down;
 			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
 			return;
-		case SDLK_F:
+		case SDLK_f:
 			right.left = down;
 			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
 			return;
-		case SDLK_H:
+		case SDLK_h:
 			right.right = down;
 			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
 			return;
-		case SDLK_T:
+		case SDLK_t:
 			right.up = down;
 			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
 			return;
-		case SDLK_G:
+		case SDLK_g:
 			right.down = down;
 			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
 			return;
@@ -337,11 +319,11 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	}
 }
 
-void MouseToJoystick(float delta_x, float delta_y) {
+void MouseToJoystick(int delta_x, int delta_y) {
 	const double distance = std::hypot(delta_x, delta_y);
 	const double scale =
 	    std::clamp(distance * GetInputMap().MouseSensitivity() + 16.0, 64.0, 128.0) / distance;
-	const auto map_axis = [scale](float delta) {
+	const auto map_axis = [scale](int delta) {
 		return std::clamp(128 + static_cast<int>(std::lround(delta * scale)), 0, 255);
 	};
 	Controller::SetRightStick(Controller::HOST_INPUT_CONTROLLER_ID, map_axis(delta_x),
@@ -357,69 +339,16 @@ void CenterMouseStick() {
 }
 
 bool SetRelativeMouseMode(bool enabled) {
-	if (SDL_SetWindowRelativeMouseMode(g_mouse_window, enabled)) {
+	if (SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) == 0) {
 		return true;
 	}
 	LOGF("Mouse-to-joystick relative mode failed: %s\n", SDL_GetError());
 	return false;
 }
-
-int PollMouse(uint64_t now_ms) {
-	if (now_ms < g_mouse.next_poll) {
-		return static_cast<int>(g_mouse.next_poll - now_ms);
-	}
-	g_mouse.next_poll = now_ms + MOUSE_POLL_INTERVAL_MS;
-
-	float delta_x = 0;
-	float delta_y = 0;
-	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (delta_x == 0 && delta_y == 0) {
-		CenterMouseStick();
-	} else {
-		MouseToJoystick(delta_x, delta_y);
-		g_mouse.output = true;
-	}
-	return MOUSE_POLL_INTERVAL_MS;
-}
-
-bool IsCursorActivity(const SDL_Event& event) {
-	SDL_MouseID which;
-	switch (event.type) {
-		case SDL_EVENT_MOUSE_MOTION:
-			if (event.motion.xrel == 0.0f && event.motion.yrel == 0.0f) {
-				return false;
-			}
-			which = event.motion.which;
-			break;
-		case SDL_EVENT_MOUSE_BUTTON_DOWN:
-		case SDL_EVENT_MOUSE_BUTTON_UP: which = event.button.which; break;
-		case SDL_EVENT_MOUSE_WHEEL: which = event.wheel.which; break;
-		default: return false;
-	}
-	return which != SDL_TOUCH_MOUSEID && which != SDL_PEN_MOUSEID;
-}
-
 } // namespace
 
-void HostInputInit(SDL_Window* window) {
+void HostInputInit() {
 	GetInputMap();
-	g_mouse_window = window;
-	if (Config::HideCursorEnabled()) {
-		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
-	}
-}
-
-void HostInputShutdown() {
-	if (g_mouse.enabled) {
-		SetRelativeMouseMode(false);
-		CenterMouseStick();
-		g_mouse = {};
-	}
-	g_mouse_window   = nullptr;
-	g_cursor_hide_at = 0;
-	if (Config::HideCursorEnabled()) {
-		SDL_ShowCursor();
-	}
 }
 
 void HostInputKey(int key_code, bool down) {
@@ -450,50 +379,51 @@ void HostInputToggleMouseToJoystick() {
 	if (!SetRelativeMouseMode(true)) {
 		return;
 	}
-	g_mouse.enabled = true;
+	int ignored_x = 0;
+	int ignored_y = 0;
+	SDL_GetRelativeMouseState(&ignored_x, &ignored_y);
+	g_mouse.enabled   = true;
+	g_mouse.next_poll = SDL_GetTicks64() + MOUSE_POLL_INTERVAL_MS;
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
-bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
-	int timeout = -1;
-	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
-		g_mouse.next_poll = 0;
+int PollMouse(uint64_t now_ms) {
+	if (now_ms < g_mouse.next_poll) {
+		return static_cast<int>(g_mouse.next_poll - now_ms);
+	}
+	g_mouse.next_poll = now_ms + MOUSE_POLL_INTERVAL_MS;
+
+	int delta_x = 0;
+	int delta_y = 0;
+	SDL_GetRelativeMouseState(&delta_x, &delta_y);
+	if (delta_x == 0 && delta_y == 0) {
 		CenterMouseStick();
-	} else {
-		if (g_mouse.next_poll == 0) {
-			SDL_GetRelativeMouseState(nullptr, nullptr);
-			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
-		}
-		timeout = PollMouse(SDL_GetTicks());
+		return MOUSE_POLL_INTERVAL_MS;
 	}
 
-	if (g_cursor_hide_at != 0) {
-		const auto now_ms = SDL_GetTicks();
-		const int  cursor_timeout =
-		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
-		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
-	}
-	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
-	const bool has_event = SDL_WaitEventTimeout(event, timeout);
+	MouseToJoystick(delta_x, delta_y);
+	g_mouse.output = true;
+	return MOUSE_POLL_INTERVAL_MS;
+}
 
-	if (Config::HideCursorEnabled()) {
-		const auto now_ms = SDL_GetTicks();
-		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
-		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
-			SDL_ShowCursor();
-			g_cursor_hide_at = now_ms + CURSOR_IDLE_HIDE_MS;
-		} else if (g_cursor_hide_at != 0 && now_ms >= g_cursor_hide_at) {
-			SDL_HideCursor();
-			g_cursor_hide_at = 0;
-		}
-	}
-
-	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
-	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
-		g_mouse.next_poll = 0;
+bool HostInputWaitEvent(SDL_Event* event) {
+	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
 		CenterMouseStick();
+		if (SDL_WaitEvent(event) == 0) {
+			EXIT("%s\n", SDL_GetError());
+		}
+		return true;
 	}
-	return has_event;
+
+	const int timeout_ms = PollMouse(SDL_GetTicks64());
+	SDL_ClearError();
+	if (SDL_WaitEventTimeout(event, timeout_ms) != 0) {
+		return true;
+	}
+	if (SDL_GetError()[0] != '\0') {
+		EXIT("%s\n", SDL_GetError());
+	}
+	return false;
 }
 
 } // namespace Libs::Graphics

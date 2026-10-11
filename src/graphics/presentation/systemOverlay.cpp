@@ -1,23 +1,15 @@
 #include "graphics/presentation/systemOverlay.h"
 
-#include <SDL3/SDL.h>
-
+#include "SDL.h"
 #include "common/assert.h"
-#include "common/emulatorConfig.h"
-#include "common/file.h"
-#include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/presentation/ddsImage.h"
 #include "imgui.h"
-#include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
 #include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
-#include "loader/systemContent.h"
-#include "stb_image.h"
 
 #include <algorithm>
 #include <array>
@@ -25,28 +17,22 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
-#include <fmt/format.h>
-#include <limits>
-#include <memory>
 #include <mutex>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 namespace Libs::Graphics {
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
-
-namespace CoreIme      = Libs::Ime;
-namespace DialogIme    = Libs::Dialog::ImeDialog;
-namespace SystemDialog = Libs::Dialog::SystemDialog;
+namespace CoreIme     = Libs::Ime;
+namespace DialogIme   = Libs::Dialog::ImeDialog;
+namespace ErrorDialog = Libs::Dialog::ErrorDialog;
 
 namespace Ime {
 
@@ -119,7 +105,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Dialog };
+enum class OverlayKind : uint8_t { None, Ime, Error };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -129,14 +115,14 @@ struct OverlaySession {
 };
 
 struct OverlaySnapshot {
-	OverlaySession             session;
-	Ime::HostSnapshot          ime;
-	SystemDialog::HostSnapshot dialog;
+	OverlaySession            session;
+	Ime::HostSnapshot         ime;
+	ErrorDialog::HostSnapshot error;
 };
 
 bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
-	if (SystemDialog::GetHostSnapshot(&snapshot->dialog)) {
-		snapshot->session = {OverlayKind::Dialog, snapshot->dialog.generation};
+	if (ErrorDialog::GetHostSnapshot(&snapshot->error)) {
+		snapshot->session = {OverlayKind::Error, snapshot->error.generation};
 		return true;
 	}
 	if (Ime::GetHostSnapshot(&snapshot->ime)) {
@@ -185,57 +171,13 @@ bool                         g_input_reset_requested      = false;
 uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
 OverlaySession               g_input_session;
-bool                         g_input_active               = false;
-bool                         g_input_controller           = false;
-bool                         g_input_keyboard             = false;
-bool                         g_input_multiline            = false;
-bool                         g_input_lifecycle_active     = false;
-bool                         g_controller_captured        = false;
+bool                         g_input_active           = false;
+bool                         g_input_controller       = false;
+bool                         g_input_keyboard         = false;
+bool                         g_input_multiline        = false;
+bool                         g_input_lifecycle_active = false;
+bool                         g_controller_captured    = false;
 OverlaySession               g_session;
-SDL_Window*                  g_input_window               = nullptr;
-struct TrophyNotification {
-	std::string            name;
-	int32_t                grade;
-	std::vector<std::byte> icon_png;
-};
-std::mutex                     g_trophy_notification_mutex;
-std::deque<TrophyNotification> g_trophy_notifications;
-std::atomic<bool>              g_trophy_notification_active {false};
-std::array<std::filesystem::path, 2> g_splash_paths;
-std::atomic<bool>                    g_splash_active {false};
-std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
-bool                                 g_splash_fast = false;
-
-std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_size, float width) {
-	std::vector<std::string_view> lines;
-	auto* const                  font = ImGui::GetFont();
-	for (;;) {
-		const auto newline   = text.find('\n');
-		const auto paragraph = text.substr(0, newline);
-		auto       line      = paragraph.substr(0, 0);
-		for (auto start = paragraph.find_first_not_of(" \t\r"); start != std::string_view::npos;) {
-			const auto end  = std::min(paragraph.find_first_of(" \t\r", start), paragraph.size());
-			const auto word = paragraph.substr(start, end - start);
-			const std::string_view candidate(line.empty() ? word.begin() : line.begin(),
-			                                 word.end());
-			// Keep an oversized word intact; the toast's clip rectangle handles overflow.
-			if (!line.empty() && font->CalcTextSizeA(font_size, std::numeric_limits<float>::max(),
-			                                       0.0f, candidate.data(),
-			                                       candidate.data() + candidate.size()).x > width) {
-				lines.push_back(line);
-				line = word;
-			} else {
-				line = candidate;
-			}
-			start = paragraph.find_first_not_of(" \t\r", end);
-		}
-		lines.push_back(line);
-		if (newline == std::string_view::npos) {
-			return lines;
-		}
-		text.remove_prefix(newline + 1);
-	}
-}
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -272,7 +214,7 @@ void RetryVisibilityWakeup() {
 	}
 	SDL_Event event {};
 	event.type = type;
-	if (SDL_PushEvent(&event)) {
+	if (SDL_PushEvent(&event) > 0) {
 		g_missing_visibility_wakeups--;
 	}
 }
@@ -292,7 +234,7 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Dialog) {
+	if (snapshot.session.kind == OverlayKind::Error) {
 		capture_controller = true;
 		capture_keyboard   = true;
 	} else if (snapshot.session.kind == OverlayKind::Ime) {
@@ -312,7 +254,7 @@ void RefreshVisibility() {
 		std::scoped_lock input_lock(g_input_mutex);
 		g_visibility_updates.push_back({snapshot.session, visible, capture_controller,
 		                                capture_keyboard, text_input, multiline});
-		if (g_missing_visibility_wakeups != 0 || !SDL_PushEvent(&event)) {
+		if (g_missing_visibility_wakeups != 0 || SDL_PushEvent(&event) <= 0) {
 			g_missing_visibility_wakeups++;
 		}
 	}
@@ -328,16 +270,16 @@ void OnDialogVisibilityChanged(bool, uint64_t) {
 
 uint32_t ExternalKeyStatus(SDL_Keymod modifiers, bool character_valid) {
 	uint32_t status = 0x00000001 | (character_valid ? 0x00000002 : 0);
-	if ((modifiers & SDL_KMOD_LCTRL) != 0) status |= 0x00000100;
-	if ((modifiers & SDL_KMOD_LSHIFT) != 0) status |= 0x00000200;
-	if ((modifiers & SDL_KMOD_LALT) != 0) status |= 0x00000400;
-	if ((modifiers & SDL_KMOD_LGUI) != 0) status |= 0x00000800;
-	if ((modifiers & SDL_KMOD_RCTRL) != 0) status |= 0x00001000;
-	if ((modifiers & SDL_KMOD_RSHIFT) != 0) status |= 0x00002000;
-	if ((modifiers & SDL_KMOD_RALT) != 0) status |= 0x00004000;
-	if ((modifiers & SDL_KMOD_RGUI) != 0) status |= 0x00008000;
-	if ((modifiers & SDL_KMOD_NUM) != 0) status |= 0x00010000;
-	if ((modifiers & SDL_KMOD_CAPS) != 0) status |= 0x00020000;
+	if ((modifiers & KMOD_LCTRL) != 0) status |= 0x00000100;
+	if ((modifiers & KMOD_LSHIFT) != 0) status |= 0x00000200;
+	if ((modifiers & KMOD_LALT) != 0) status |= 0x00000400;
+	if ((modifiers & KMOD_LGUI) != 0) status |= 0x00000800;
+	if ((modifiers & KMOD_RCTRL) != 0) status |= 0x00001000;
+	if ((modifiers & KMOD_RSHIFT) != 0) status |= 0x00002000;
+	if ((modifiers & KMOD_RALT) != 0) status |= 0x00004000;
+	if ((modifiers & KMOD_RGUI) != 0) status |= 0x00008000;
+	if ((modifiers & KMOD_NUM) != 0) status |= 0x00010000;
+	if ((modifiers & KMOD_CAPS) != 0) status |= 0x00020000;
 	return status;
 }
 
@@ -452,14 +394,14 @@ float AlignmentPivot(Ime::Alignment alignment) {
 
 ImGuiKey ControllerButtonToKey(int button) {
 	switch (button) {
-		case SDL_GAMEPAD_BUTTON_SOUTH: return ImGuiKey_GamepadFaceDown;
-		case SDL_GAMEPAD_BUTTON_EAST: return ImGuiKey_GamepadFaceRight;
-		case SDL_GAMEPAD_BUTTON_WEST: return ImGuiKey_GamepadFaceLeft;
-		case SDL_GAMEPAD_BUTTON_NORTH: return ImGuiKey_GamepadFaceUp;
-		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
-		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
-		case SDL_GAMEPAD_BUTTON_DPAD_UP: return ImGuiKey_GamepadDpadUp;
-		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
+		case SDL_CONTROLLER_BUTTON_A: return ImGuiKey_GamepadFaceDown;
+		case SDL_CONTROLLER_BUTTON_B: return ImGuiKey_GamepadFaceRight;
+		case SDL_CONTROLLER_BUTTON_X: return ImGuiKey_GamepadFaceLeft;
+		case SDL_CONTROLLER_BUTTON_Y: return ImGuiKey_GamepadFaceUp;
+		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
+		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
+		case SDL_CONTROLLER_BUTTON_DPAD_UP: return ImGuiKey_GamepadDpadUp;
+		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
 		default: return ImGuiKey_None;
 	}
 }
@@ -475,34 +417,9 @@ void CheckVulkanResult(VkResult result) {
 
 } // namespace
 
-void InitializeSplashScreen(const std::filesystem::path& sce_sys) {
-	const auto language = Config::GetConsoleLanguage();
-	for (size_t i = 0; i < g_splash_paths.size(); ++i) {
-		auto& path = g_splash_paths[i];
-		path       = sce_sys / fmt::format("pic{}_{:02}.dds", i + 1, language);
-		if (!Common::File::IsFileExisting(path)) {
-			path = sce_sys / fmt::format("pic{}.dds", i + 1);
-		}
-	}
-	int32_t attribute = 0;
-	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute);
-	g_splash_fast = (attribute & 0x1000) != 0;
-	g_splash_hidden_at.store(0, std::memory_order_release);
-	g_splash_active.store(Common::File::IsFileExisting(g_splash_paths[0]) &&
-	                          Common::File::IsFileExisting(g_splash_paths[1]),
-	                      std::memory_order_release);
-}
-
-void HideSplashScreen() {
-	Clock::duration::rep expected = 0;
-	g_splash_hidden_at.compare_exchange_strong(expected, Clock::now().time_since_epoch().count());
-}
-
-void InitializeSystemOverlayInput(SDL_Window* window) {
-	EXIT_IF(window == nullptr);
+void InitializeSystemOverlayInput() {
 	const Uint32 type = SDL_RegisterEvents(1);
 	EXIT_IF(type == static_cast<Uint32>(-1));
-	g_input_window = window;
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = true;
@@ -510,15 +427,14 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 	}
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
-	SystemDialog::SetVisibilityCallback(RefreshVisibility);
+	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
 }
 
 void ShutdownSystemOverlayInput() {
-	g_splash_active.store(false, std::memory_order_release);
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
-	SystemDialog::SetVisibilityCallback(nullptr);
+	ErrorDialog::SetVisibilityCallback(nullptr);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
@@ -539,21 +455,17 @@ void ShutdownSystemOverlayInput() {
 	g_input_controller = false;
 	g_input_keyboard   = false;
 	g_input_multiline  = false;
-	if (g_input_window != nullptr && SDL_TextInputActive(g_input_window)) {
-		SDL_StopTextInput(g_input_window);
+	if (SDL_IsTextInputActive() == SDL_TRUE) {
+		SDL_StopTextInput();
 	}
-	g_input_window = nullptr;
 }
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
-	const auto system = SystemDialog::GetVisualState();
-	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
-	const bool splash        = g_splash_active.load(std::memory_order_acquire);
-	return {core.active || dialog.active || system.active || trophy_active || splash,
-	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u)};
+	const auto error  = ErrorDialog::GetVisualState();
+	return {core.active || dialog.active || error.active,
+	        core.revision + dialog.revision + error.revision};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -577,13 +489,13 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		g_input_keyboard        = update.capture_keyboard;
 		g_input_multiline       = update.multiline;
 		if (update.text_input) {
-			SDL_StartTextInput(g_input_window);
-		} else if (SDL_TextInputActive(g_input_window)) {
-			SDL_StopTextInput(g_input_window);
+			SDL_StartTextInput();
+		} else if (SDL_IsTextInputActive() == SDL_TRUE) {
+			SDL_StopTextInput();
 		}
 		return true;
 	}
-	if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
+	if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
 		if (g_input_active && g_input_controller) {
 			QueueInput({InputKind::ResetController, g_input_session, 0, 0.0f, 0.0f});
 		}
@@ -595,27 +507,26 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 
 	const auto     session          = g_input_session;
 	const uint64_t generation       = session.generation;
-	const bool     controller_event = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
-	                                  event.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
-	                                  event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
+	const bool     controller_event = event.type == SDL_CONTROLLERBUTTONDOWN ||
+	                                  event.type == SDL_CONTROLLERBUTTONUP ||
+	                                  event.type == SDL_CONTROLLERAXISMOTION;
 	if (controller_event && !g_input_controller) {
 		return false;
 	}
-	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_TEXT_EDITING ||
-	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
+	const bool keyboard_event = event.type == SDL_TEXTINPUT || event.type == SDL_TEXTEDITING ||
+	                            event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
 	}
-	if (keyboard_event && session.kind == OverlayKind::Dialog) {
-		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-		    (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
-		     event.key.key == SDLK_ESCAPE)) {
-			SystemDialog::HostClose(generation);
+	if (keyboard_event && session.kind == OverlayKind::Error) {
+		if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
+		    (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_KP_ENTER)) {
+			ErrorDialog::HostAccept(generation);
 		}
 		return true;
 	}
 	switch (event.type) {
-		case SDL_EVENT_TEXT_INPUT: {
+		case SDL_TEXTINPUT: {
 			const auto text = Utf8ToUtf16(event.text.text);
 			if (!text.empty()) {
 				auto input = MakeExternalInput(Ime::ExternalAction::Text, g_last_external_keycode,
@@ -626,24 +537,26 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			}
 			return true;
 		}
-		case SDL_EVENT_TEXT_EDITING: return true;
-		case SDL_EVENT_KEY_DOWN: {
-			g_last_external_keycode = static_cast<uint16_t>(event.key.scancode);
-			g_last_external_status  = ExternalKeyStatus(event.key.mod, false);
+		case SDL_TEXTEDITING: return true;
+		case SDL_KEYDOWN: {
+			g_last_external_keycode = static_cast<uint16_t>(event.key.keysym.scancode);
+			g_last_external_status =
+			    ExternalKeyStatus(static_cast<SDL_Keymod>(event.key.keysym.mod), false);
 			auto action = Ime::ExternalAction::Text;
 			bool queue  = true;
-			if (event.key.key == SDLK_BACKSPACE) {
+			if (event.key.keysym.sym == SDLK_BACKSPACE) {
 				action = Ime::ExternalAction::Backspace;
-			} else if (event.key.key == SDLK_LEFT) {
+			} else if (event.key.keysym.sym == SDLK_LEFT) {
 				action = Ime::ExternalAction::MoveLeft;
-			} else if (event.key.key == SDLK_RIGHT) {
+			} else if (event.key.keysym.sym == SDLK_RIGHT) {
 				action = Ime::ExternalAction::MoveRight;
-			} else if (event.key.key == SDLK_ESCAPE) {
+			} else if (event.key.keysym.sym == SDLK_ESCAPE) {
 				action = Ime::ExternalAction::Cancel;
-			} else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+			} else if (event.key.keysym.sym == SDLK_RETURN ||
+			           event.key.keysym.sym == SDLK_KP_ENTER) {
 				action =
 				    g_input_multiline ? Ime::ExternalAction::Newline : Ime::ExternalAction::Accept;
-			} else if (event.key.key == SDLK_TAB) {
+			} else if (event.key.keysym.sym == SDLK_TAB) {
 				action = Ime::ExternalAction::None;
 			} else {
 				queue = false;
@@ -655,28 +568,28 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			}
 			return true;
 		}
-		case SDL_EVENT_KEY_UP: return true;
-		case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-		case SDL_EVENT_GAMEPAD_BUTTON_UP:
-			QueueInput({InputKind::Button, session, event.gbutton.button,
-			            event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? 1.0f : 0.0f, 0.0f});
+		case SDL_KEYUP: return true;
+		case SDL_CONTROLLERBUTTONDOWN:
+		case SDL_CONTROLLERBUTTONUP:
+			QueueInput({InputKind::Button, session, event.cbutton.button,
+			            event.type == SDL_CONTROLLERBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
-		case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-			QueueInput({InputKind::Axis, session, event.gaxis.axis,
-			            static_cast<float>(event.gaxis.value), 0.0f});
+		case SDL_CONTROLLERAXISMOTION:
+			QueueInput({InputKind::Axis, session, event.caxis.axis,
+			            static_cast<float>(event.caxis.value), 0.0f});
 			return true;
-		case SDL_EVENT_MOUSE_MOTION:
+		case SDL_MOUSEMOTION:
 			QueueInput({InputKind::MousePosition, session, 0, static_cast<float>(event.motion.x),
 			            static_cast<float>(event.motion.y)});
 			return true;
-		case SDL_EVENT_MOUSE_BUTTON_DOWN:
-		case SDL_EVENT_MOUSE_BUTTON_UP:
+		case SDL_MOUSEBUTTONDOWN:
+		case SDL_MOUSEBUTTONUP:
 			QueueInput({InputKind::MousePosition, session, 0, static_cast<float>(event.button.x),
 			            static_cast<float>(event.button.y)});
 			QueueInput({InputKind::MouseButton, session, event.button.button,
-			            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? 1.0f : 0.0f, 0.0f});
+			            event.type == SDL_MOUSEBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
-		case SDL_EVENT_MOUSE_WHEEL:
+		case SDL_MOUSEWHEEL:
 			QueueInput({InputKind::MouseWheel, session, 0, static_cast<float>(event.wheel.x),
 			            static_cast<float>(event.wheel.y)});
 			return true;
@@ -684,32 +597,12 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	}
 }
 
-void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
-                          std::span<const std::byte> icon_png) {
-	std::scoped_lock lock(g_trophy_notification_mutex);
-	g_trophy_notifications.push_back(
-	    {std::string(name), grade, std::vector<std::byte>(icon_png.begin(), icon_png.end())});
-	g_trophy_notification_active.store(true, std::memory_order_release);
-}
-
 struct SystemOverlay::Impl {
 	explicit Impl(GraphicContext& context): graphics(context) {}
 
 	~Impl() {
-		SDL_DestroyAudioStream(trophy_sound_stream);
-		SDL_free(trophy_sound_data);
-		if (trophy_sound_initialized) {
-			SDL_QuitSubSystem(SDL_INIT_AUDIO);
-		}
 		ReleaseVulkan();
 		if (imgui_context != nullptr) {
-			ImGui::SetCurrentContext(imgui_context);
-			if (trophy_notification_image) {
-				ImGui::UnregisterUserTexture(trophy_notification_image.get());
-			}
-			for (const auto& texture: retired_trophy_images) {
-				ImGui::UnregisterUserTexture(texture.get());
-			}
 			ImGui::DestroyContext(imgui_context);
 		}
 	}
@@ -729,139 +622,25 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
+		// The default font first (dialogs); the panels' where Windows has it.
+		io.Fonts->AddFontDefault();
+#ifdef _WIN32
+		const char* windows = std::getenv("WINDIR");
+		const auto  fonts = std::string(windows != nullptr ? windows : "C:\\Windows") + "\\Fonts\\";
+		const auto  exists = [](const std::string& path) {
+			FILE* file = std::fopen(path.c_str(), "rb");
+			if (file != nullptr) std::fclose(file);
+			return file != nullptr;
+		};
+		if (exists(fonts + "segoeuib.ttf")) {
+			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
+		}
+#endif
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
 		style.FrameRounding  = 6.0f;
 		style.ItemSpacing    = {8.0f, 8.0f};
-	}
-
-	void PlayTrophySound() {
-		if (!trophy_sound_attempted) {
-			trophy_sound_attempted   = true;
-			trophy_sound_initialized = SDL_InitSubSystem(SDL_INIT_AUDIO);
-			if (!trophy_sound_initialized) {
-				LOGF("[Trophy] could not initialize audio: %s\n", SDL_GetError());
-				return;
-			}
-			const char* base_path = SDL_GetBasePath();
-			if (base_path == nullptr) {
-				LOGF("[Trophy] could not locate sound: %s\n", SDL_GetError());
-				return;
-			}
-			const std::string path = std::string(base_path) + "assets/sounds/trophy-unlock.wav";
-			SDL_AudioSpec     spec {};
-			if (!SDL_LoadWAV(path.c_str(), &spec, &trophy_sound_data, &trophy_sound_size)) {
-				LOGF("[Trophy] could not load %s: %s\n", path.c_str(), SDL_GetError());
-				return;
-			}
-			if (trophy_sound_size > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-				LOGF("[Trophy] sound is too large: %s\n", path.c_str());
-				return;
-			}
-			trophy_sound_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-			                                                &spec, nullptr, nullptr);
-			if (trophy_sound_stream == nullptr) {
-				LOGF("[Trophy] could not open audio stream: %s\n", SDL_GetError());
-				return;
-			}
-		}
-		if (trophy_sound_stream != nullptr &&
-		    (!SDL_PutAudioStreamData(trophy_sound_stream, trophy_sound_data,
-		                             static_cast<int>(trophy_sound_size)) ||
-		     !SDL_ResumeAudioStreamDevice(trophy_sound_stream))) {
-			LOGF("[Trophy] could not play sound: %s\n", SDL_GetError());
-		}
-	}
-
-	std::unique_ptr<ImTextureData> LoadTrophyIcon(std::span<const std::byte> encoded) {
-		if (encoded.empty() ||
-		    encoded.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-			return nullptr;
-		}
-
-		const auto* data   = reinterpret_cast<const stbi_uc*>(encoded.data());
-		const int   size   = static_cast<int>(encoded.size());
-		int         width  = 0;
-		int         height = 0;
-		if (!stbi_info_from_memory(data, size, &width, &height, nullptr) || width <= 0 ||
-		    height <= 0 || width > 512 || height > 512) {
-			LOGF("[Trophy] invalid icon or dimensions exceed 512x512\n");
-			return nullptr;
-		}
-		auto* pixels = stbi_load_from_memory(data, size, &width, &height, nullptr, 4);
-		if (pixels == nullptr) {
-			LOGF("[Trophy] could not decode trophy icon: %s\n", stbi_failure_reason());
-			return nullptr;
-		}
-
-		auto texture = std::make_unique<ImTextureData>();
-		texture->Create(ImTextureFormat_RGBA32, width, height);
-		std::memcpy(texture->Pixels, pixels,
-		            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
-		texture->UseColors = true;
-		stbi_image_free(pixels);
-		ImGui::RegisterUserTexture(texture.get());
-		return texture;
-	}
-
-	void FinishSplash() {
-		g_splash_active.store(false, std::memory_order_release);
-		if (splash_dds[0] || splash_dds[1]) {
-			Common::LockGuard lock(graphics.queue_mutex);
-			RequireVulkanSuccess(graphics.queue.waitIdle(), "retire splash images");
-			splash_dds = {};
-		}
-	}
-
-	void DrawSplash(vk::Extent2D frame_extent) {
-		if (!g_splash_active.load(std::memory_order_acquire)) {
-			return;
-		}
-		for (size_t i = 0; i < g_splash_paths.size(); ++i) {
-			if (splash_dds[i]) {
-				continue;
-			}
-			const auto& path = g_splash_paths[i];
-			auto image = std::make_unique<DdsImage>(graphics);
-			if (!image->Load(path)) {
-				LOGF("[Splash] could not load %s\n", path.string().c_str());
-				FinishSplash();
-				return;
-			}
-			splash_dds[i] = std::move(image);
-		}
-		const auto now = Clock::now();
-		if (splash_born == Clock::time_point {}) {
-			splash_born = now;
-		}
-		const auto  hidden = g_splash_hidden_at.load(std::memory_order_acquire);
-		const float fade =
-		    hidden == 0
-		        ? 0.0f
-		        : std::chrono::duration<float>(now.time_since_epoch() - Clock::duration {hidden})
-		                  .count() /
-		              0.3f;
-		const float alpha = 1.0f - std::clamp(fade, 0.0f, 1.0f);
-		if (alpha == 0.0f) {
-			FinishSplash();
-			return;
-		}
-		const float  age  = std::chrono::duration<float>(now - splash_born).count();
-		const float  logo = g_splash_fast ? 1.0f : std::clamp((age - 1.4f) / 2.2f, 0.0f, 1.0f);
-		const ImVec2 screen {static_cast<float>(frame_extent.width),
-		                     static_cast<float>(frame_extent.height)};
-		const float  fit = std::min(screen.x / 3840.0f, screen.y / 2160.0f);
-		const ImVec2 size {3840.0f * fit, 2160.0f * fit};
-		const ImVec2 begin {(screen.x - size.x) * 0.5f, (screen.y - size.y) * 0.5f};
-		const ImVec2 end {begin.x + size.x, begin.y + size.y};
-		auto*        draw = ImGui::GetBackgroundDrawList();
-		draw->AddRectFilled({0, 0}, screen, IM_COL32(0, 0, 0, static_cast<int>(255.0f * alpha)));
-		for (size_t i = 0; i < g_splash_paths.size(); ++i) {
-			draw->AddImage(
-			    splash_dds[i]->Texture(), begin, end, {0, 0}, {1, 1},
-			    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * (i == 0 ? 1.0f : logo))));
-		}
 	}
 
 	void EnsureVulkan(vk::Format format, uint32_t image_count) {
@@ -918,9 +697,9 @@ struct SystemOverlay::Impl {
 				case InputKind::Button: {
 					const bool down = event.x != 0.0f;
 					if (session.kind == OverlayKind::Ime && down) {
-						if (event.id == SDL_GAMEPAD_BUTTON_EAST) {
+						if (event.id == SDL_CONTROLLER_BUTTON_B) {
 							Ime::HostCancel(session.generation);
-						} else if (event.id == SDL_GAMEPAD_BUTTON_NORTH) {
+						} else if (event.id == SDL_CONTROLLER_BUTTON_Y) {
 							Ime::HostBackspace(session.generation);
 						}
 					}
@@ -932,19 +711,19 @@ struct SystemOverlay::Impl {
 				}
 				case InputKind::Axis: {
 					const float value = event.x / (event.x < 0.0f ? 32768.0f : 32767.0f);
-					if (event.id == SDL_GAMEPAD_AXIS_LEFTX) {
+					if (event.id == SDL_CONTROLLER_AXIS_LEFTX) {
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, value < -0.25f,
 						                     std::max(-value, 0.0f));
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickRight, value > 0.25f,
 						                     std::max(value, 0.0f));
-					} else if (event.id == SDL_GAMEPAD_AXIS_LEFTY) {
+					} else if (event.id == SDL_CONTROLLER_AXIS_LEFTY) {
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, value < -0.25f,
 						                     std::max(-value, 0.0f));
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, value > 0.25f,
 						                     std::max(value, 0.0f));
-					} else if (event.id == SDL_GAMEPAD_AXIS_RIGHTX) {
+					} else if (event.id == SDL_CONTROLLER_AXIS_RIGHTX) {
 						right_stick.x = std::abs(value) > 0.2f ? value : 0.0f;
-					} else if (event.id == SDL_GAMEPAD_AXIS_RIGHTY) {
+					} else if (event.id == SDL_CONTROLLER_AXIS_RIGHTY) {
 						right_stick.y = std::abs(value) > 0.2f ? value : 0.0f;
 					}
 					break;
@@ -1138,7 +917,7 @@ struct SystemOverlay::Impl {
 		ImGui::End();
 	}
 
-	void DrawDialog(const SystemDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
+	void DrawError(const ErrorDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
 		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
 		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
 		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,
@@ -1156,23 +935,17 @@ struct SystemOverlay::Impl {
 		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
 		                                   ImGuiWindowFlags_NoSavedSettings |
 		                                   ImGuiWindowFlags_AlwaysAutoResize;
-		const bool                 signin = snapshot.kind == SystemDialog::Kind::Signin;
-		ImGui::Begin("##SystemDialog", nullptr, flags);
-		ImGui::TextUnformatted(signin ? "Sign in to PlayStation Network" : "Error");
+		ImGui::Begin("##SystemError", nullptr, flags);
+		ImGui::TextUnformatted("Error");
 		ImGui::Separator();
 		const auto error_code = static_cast<uint32_t>(snapshot.error_code);
-		ImGui::TextWrapped("%s", signin ? "PlayStation Network sign-in is unavailable."
-		                         : error_code == 0x80550006u
+		ImGui::TextWrapped("%s", error_code == 0x80550006u
 		                             ? "You are not signed in to PlayStation Network."
 		                             : "An error has occurred.");
-		if (!signin) {
-			ImGui::TextDisabled("Error code: 0x%08X", error_code);
-		}
+		ImGui::TextDisabled("Error code: 0x%08X", error_code);
 		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);
 		ImGui::SetCursorPosX((ImGui::GetWindowSize().x - button_width) * 0.5f);
-		const bool accepted =
-		    ImGui::Button(signin ? "Cancel" : "OK", {button_width, 44.0f * scale}) ||
-		    (signin && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false));
+		const bool accepted = ImGui::Button("OK", {button_width, 44.0f * scale});
 		if (focus_pending) {
 			ImGui::SetItemDefaultFocus();
 			focus_pending = false;
@@ -1181,145 +954,89 @@ struct SystemOverlay::Impl {
 		ImGui::PopFont();
 		ImGui::PopStyleVar(2);
 		if (accepted) {
-			SystemDialog::HostClose(snapshot.generation);
+			ErrorDialog::HostAccept(snapshot.generation);
 		}
 	}
 
-	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now) {
-		std::erase_if(retired_trophy_images, [](const auto& texture) {
-			if (texture->Status != ImTextureStatus_Destroyed) {
-				return false;
-			}
-			ImGui::UnregisterUserTexture(texture.get());
-			return true;
-		});
-		constexpr float TOAST_LIFETIME = 5.0f;
-		if (trophy_notification &&
-		    std::chrono::duration<float>(now - trophy_notification_born).count() >=
-		        TOAST_LIFETIME) {
-			trophy_notification.reset();
-			if (trophy_notification_image) {
-				// Keep the texture registered until the backend retires in-flight frames.
-				trophy_notification_image->WantDestroyNextFrame = true;
-				retired_trophy_images.push_back(std::move(trophy_notification_image));
-			}
-		}
-		if (!trophy_notification) {
-			{
-				std::scoped_lock lock(g_trophy_notification_mutex);
-				if (g_trophy_notifications.empty()) {
-					g_trophy_notification_active.store(!retired_trophy_images.empty(),
-					                                   std::memory_order_release);
-					return;
-				}
-				trophy_notification = std::move(g_trophy_notifications.front());
-				g_trophy_notifications.pop_front();
-			}
-			trophy_notification_born  = now;
-			trophy_notification_image = LoadTrophyIcon(trophy_notification->icon_png);
-			PlayTrophySound();
-		}
-		const float age = std::chrono::duration<float>(now - trophy_notification_born).count();
-		const float screen_scale =
-		    std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
-		                        static_cast<float>(frame_extent.height) / 1080.0f),
-		               0.65f, 1.25f);
-		const float width = std::max(
-		    0.0f, std::min(520.0f * screen_scale, static_cast<float>(frame_extent.width) - 32.0f));
-		constexpr std::array GRADE_COLORS {
-		    IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255), IM_COL32(211, 220, 232, 255),
-		    IM_COL32(211, 142, 91, 255)};
-		const int   grade        = trophy_notification->grade;
-		const bool  has_grade    = grade > 0 && grade <= static_cast<int>(GRADE_COLORS.size());
-		const float pad          = 10.0f * screen_scale;
-		const float base_height  = 104.0f * screen_scale;
-		const float icon_size    = base_height - 2.0f * pad;
-		const float text_offset  = trophy_notification_image != nullptr
-		                               ? pad + icon_size + 18.0f * screen_scale
-		                               : 20.0f * screen_scale;
-		const float title_offset = text_offset + (has_grade ? 30.0f * screen_scale : 0.0f);
-		const float title_size   = 26.0f * screen_scale;
-		const float line_height  = 30.0f * screen_scale;
-		const float text_padding = 16.0f * screen_scale;
-		const auto  title_lines  = WrapTrophyTitle(trophy_notification->name, title_size,
-		                                           width - title_offset - text_padding);
-		const float block_height =
-		    static_cast<float>(title_lines.size()) * line_height + 28.0f * screen_scale;
-		const float  height   = std::max(base_height, block_height + 2.0f * text_padding);
-		const float  rounding = 14.0f * screen_scale;
-		const float  fade_in  = std::clamp(age / 0.22f, 0.0f, 1.0f);
-		const float  fade_out = std::clamp((TOAST_LIFETIME - age) / 0.4f, 0.0f, 1.0f);
-		const float  alpha    = std::min(fade_in, fade_out);
-		const float  slide    = (1.0f - fade_in) * (width + 24.0f);
-		const ImVec2 top_left {static_cast<float>(frame_extent.width) - 32.0f - width + slide,
-		                       32.0f};
-		const ImVec2 bottom_right {top_left.x + width, top_left.y + height};
-		auto*        draw = ImGui::GetForegroundDrawList();
-		const auto   fade = [alpha](int r, int g, int b, int a) {
-            return IM_COL32(r, g, b, static_cast<int>(static_cast<float>(a) * alpha));
+	// Top right of the game image, below the game's own corner icon: the frame rate (KYTY_FPS_HUD)
+	// and under it the progress line.
+	void DrawHud(SystemOverlayHud& hud) {
+		const auto  region = hud.region;
+		const float unit   = std::max(static_cast<float>(region.extent.height) / 1080.0f, 0.5f);
+		const float right  = static_cast<float>(region.offset.x) +
+		                     static_cast<float>(region.extent.width) - 28.0f * unit;
+		float       top =
+		    static_cast<float>(region.offset.y) + static_cast<float>(region.extent.height) * 0.10f;
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16.0f * unit, 8.0f * unit});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * unit);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0.0f, 0.0f});
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings |
+		                                   ImGuiWindowFlags_AlwaysAutoResize |
+		                                   ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+		                                   ImGuiWindowFlags_NoFocusOnAppearing;
+		ImVec2                     low {right, top}, high {right, top};
+		const auto                 panel = [&](const char* name, const auto& contents) {
+			ImGui::SetNextWindowPos({right, top}, ImGuiCond_Always, {1.0f, 0.0f});
+			ImGui::SetNextWindowBgAlpha(0.45f);
+			ImGui::Begin(name, nullptr, flags);
+			contents();
+			const auto position = ImGui::GetWindowPos();
+			const auto size     = ImGui::GetWindowSize();
+			ImGui::End();
+			low  = {std::min(low.x, position.x), std::min(low.y, position.y)};
+			high = {std::max(high.x, position.x + size.x), std::max(high.y, position.y + size.y)};
+			top  = position.y + size.y + 8.0f * unit;
 		};
-		draw->AddRectFilled({top_left.x + 3.0f, top_left.y + 5.0f},
-		                    {bottom_right.x + 3.0f, bottom_right.y + 5.0f}, fade(0, 0, 0, 90),
-		                    rounding);
-		draw->AddRectFilled(top_left, bottom_right, fade(24, 26, 32, 235), rounding);
-		draw->AddRect(top_left, bottom_right, fade(255, 255, 255, 28), rounding,
-		              ImDrawFlags_RoundCornersAll, 1.0f);
-
-		const float text_left = top_left.x + text_offset;
-		if (trophy_notification_image != nullptr) {
-			const ImVec2 icon_min {top_left.x + pad, top_left.y + (height - icon_size) * 0.5f};
-			const ImVec2 icon_max {icon_min.x + icon_size, icon_min.y + icon_size};
-			draw->AddImageRounded(trophy_notification_image->GetTexRef(), icon_min, icon_max,
-			                      {0, 0}, {1, 1}, fade(255, 255, 255, 255), 8.0f * screen_scale);
-			draw->AddRect(icon_min, icon_max, fade(255, 255, 255, 40), 8.0f * screen_scale,
-			              ImDrawFlags_RoundCornersAll, 1.0f);
+		if (!hud.title.empty()) {
+			panel("##FpsHud", [&] {
+				ImGui::PushFont(hud_font, 46.0f * unit);
+				ImGui::TextColored({0.46f, 0.73f, 0.0f, 1.0f}, "%s", hud.title.c_str());
+				ImGui::PopFont();
+				ImGui::PushFont(hud_font, 21.0f * unit);
+				ImGui::TextUnformatted(hud.detail.c_str());
+				ImGui::PopFont();
+			});
 		}
-
-		const float title_y = top_left.y + (height - block_height) * 0.5f;
-		const float title_x = top_left.x + title_offset;
-		if (has_grade) {
-			// Small cup glyph tinted with the trophy grade.
-			const ImU32 cup = ImGui::GetColorU32(GRADE_COLORS[grade - 1], alpha);
-			const float u   = screen_scale;
-			const float cx  = text_left + 9.0f * u;
-			const float cy  = title_y + 15.0f * u;
-			draw->AddRectFilled({cx - 8.0f * u, cy - 11.0f * u}, {cx + 8.0f * u, cy + 2.0f * u},
-			                    cup, 2.0f * u, ImDrawFlags_RoundCornersBottom);
-			draw->AddRect({cx - 11.0f * u, cy - 9.0f * u}, {cx - 6.0f * u, cy - 3.0f * u}, cup,
-			              2.0f * u, ImDrawFlags_RoundCornersLeft, 1.8f * u);
-			draw->AddRect({cx + 6.0f * u, cy - 9.0f * u}, {cx + 11.0f * u, cy - 3.0f * u}, cup,
-			              2.0f * u, ImDrawFlags_RoundCornersRight, 1.8f * u);
-			draw->AddRectFilled({cx - 1.5f * u, cy + 2.0f * u}, {cx + 1.5f * u, cy + 7.0f * u}, cup);
-			draw->AddRectFilled({cx - 5.0f * u, cy + 7.0f * u}, {cx + 5.0f * u, cy + 10.0f * u}, cup,
-			                    1.5f * u);
+		if (!hud.status.empty()) {
+			panel("##StatusHud", [&] {
+				ImGui::PushFont(hud_font, 21.0f * unit);
+				ImGui::TextUnformatted(hud.status.c_str());
+				const float width = std::max(ImGui::GetItemRectSize().x, 260.0f * unit);
+				ImGui::PopFont();
+				ImGui::Dummy({0.0f, 6.0f * unit});
+				ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4 {0.46f, 0.73f, 0.0f, 1.0f});
+				ImGui::ProgressBar(hud.status_fraction, {width, 6.0f * unit}, "");
+				ImGui::PopStyleColor();
+			});
 		}
-		draw->PushClipRect(top_left, {bottom_right.x - text_padding, bottom_right.y}, true);
-		float line_y = title_y;
-		for (const auto line : title_lines) {
-			draw->AddText(nullptr, title_size, {title_x, line_y}, fade(255, 255, 255, 255),
-			              line.data(), line.data() + line.size());
-			line_y += line_height;
+		if (!hud.notice.empty()) {
+			panel("##NoticeHud", [&] {
+				ImGui::PushFont(hud_font, 21.0f * unit);
+				ImGui::TextUnformatted(hud.notice.c_str());
+				ImGui::PopFont();
+			});
 		}
-		draw->AddText(nullptr, 20.0f * screen_scale, {text_left, line_y + 8.0f * screen_scale},
-		              fade(176, 180, 192, 255), "Trophy earned!");
-		draw->PopClipRect();
+		ImGui::PopStyleVar(4);
+		hud.drawn = {{static_cast<int32_t>(low.x), static_cast<int32_t>(low.y)},
+		             {static_cast<uint32_t>(std::max(high.x - low.x, 0.0f)),
+		              static_cast<uint32_t>(std::max(high.y - low.y, 0.0f))}};
 	}
 
-	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
+	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count,
+	                  SystemOverlayHud* hud) {
 		OverlaySnapshot snapshot;
-		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
-		const auto now = Clock::now();
-		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
-		    !g_splash_active.load(std::memory_order_acquire)) {
+		bool            dialog = GetOverlaySnapshot(&snapshot);
+		if (!dialog && hud == nullptr) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
 		EnsureVulkan(format, image_count);
-		if (session != snapshot.session) {
+		if (dialog && session != snapshot.session) {
 			session       = snapshot.session;
 			focus_pending = true;
-			shift         = session.kind == OverlayKind::Ime &&
-			                (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
+			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
 			symbol_mode   = false;
 			panel_offset  = {};
 			right_stick   = {};
@@ -1328,11 +1045,14 @@ struct SystemOverlay::Impl {
 			io.ClearInputKeys();
 			io.ClearInputMouse();
 		}
-		DrainInput(snapshot.session);
+		if (dialog) {
+			DrainInput(snapshot.session);
+		}
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
 		                  static_cast<float>(frame_extent.height)};
+		const auto now = std::chrono::steady_clock::now();
 		io.DeltaTime   = last_frame == std::chrono::steady_clock::time_point {}
 		                     ? 1.0f / 60.0f
 		                     : std::clamp(std::chrono::duration<float>(now - last_frame).count(),
@@ -1340,27 +1060,29 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		DrawSplash(frame_extent);
-		GetOverlaySnapshot(&snapshot);
-		if (has_overlay && snapshot.session == prepared_session) {
-			if (snapshot.session.kind == OverlayKind::Dialog) {
-				DrawDialog(snapshot.dialog, frame_extent);
+		if (dialog && (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
+			if (hud == nullptr) {
+				ImGui::EndFrame();
+				return false;
+			}
+			dialog = false;
+		}
+		if (dialog) {
+			if (snapshot.session.kind == OverlayKind::Error) {
+				DrawError(snapshot.error, frame_extent);
 			} else {
 				DrawIme(snapshot.ime, frame_extent);
 			}
 		}
-		DrawTrophyNotification(frame_extent, now);
+		if (hud != nullptr) {
+			DrawHud(*hud);
+		}
 		ImGui::Render();
 		extent = frame_extent;
 		return true;
 	}
 
 	void Record(vk::CommandBuffer command, vk::ImageView target) {
-		for (const auto& image: splash_dds) {
-			if (image) {
-				image->Upload(command);
-			}
-		}
 		vk::RenderingAttachmentInfo color {};
 		color.sType       = vk::StructureType::eRenderingAttachmentInfo;
 		color.imageView   = target;
@@ -1387,13 +1109,13 @@ struct SystemOverlay::Impl {
 			return;
 		}
 		ImGui::SetCurrentContext(imgui_context);
-		splash_dds = {};
 		ImGui_ImplVulkan_Shutdown();
 		vulkan_initialized = false;
 	}
 
 	GraphicContext&                       graphics;
 	ImGuiContext*                         imgui_context      = nullptr;
+	ImFont*                               hud_font           = nullptr; // null: the default font
 	bool                                  vulkan_initialized = false;
 	bool                                  shift              = false;
 	bool                                  symbol_mode        = false;
@@ -1402,28 +1124,18 @@ struct SystemOverlay::Impl {
 	float                                 button_height      = 42.0f;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
-	OverlaySession                              session;
-	std::unique_ptr<ImTextureData>              trophy_notification_image;
-	std::optional<TrophyNotification>           trophy_notification;
-	Clock::time_point                           trophy_notification_born;
-	std::vector<std::unique_ptr<ImTextureData>> retired_trophy_images;
-	std::array<std::unique_ptr<DdsImage>, 2>      splash_dds;
-	Clock::time_point                             splash_born;
-	SDL_AudioStream*                            trophy_sound_stream      = nullptr;
-	uint8_t*                                    trophy_sound_data        = nullptr;
-	uint32_t                                    trophy_sound_size        = 0;
-	bool                                        trophy_sound_attempted   = false;
-	bool                                        trophy_sound_initialized = false;
-	vk::Extent2D                                extent {};
-	std::chrono::steady_clock::time_point       last_frame;
+	OverlaySession                        session;
+	vk::Extent2D                          extent {};
+	std::chrono::steady_clock::time_point last_frame;
 };
 
 SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}
 
 SystemOverlay::~SystemOverlay() = default;
 
-bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count) {
-	return m_impl->PrepareFrame(extent, format, image_count);
+bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count,
+                                 SystemOverlayHud* hud) {
+	return m_impl->PrepareFrame(extent, format, image_count, hud);
 }
 
 void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
