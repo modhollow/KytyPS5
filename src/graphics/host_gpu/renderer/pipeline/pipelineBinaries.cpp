@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCacheFile.h"
 #include "local-platform.h"
 
 #include <algorithm>
@@ -91,13 +92,16 @@ bool PipelineBinaries::PipelineKey(vk::Device device, const void* create_info, K
 std::unique_ptr<PipelineBinaries> PipelineBinaries::Open(vk::Device                   device,
                                                          const std::filesystem::path& path,
                                                          const std::string&           signature) {
+	// The native form past MAX_PATH too (a precompile shard under a user folder).
+	const auto      native = PipelineCacheFile::NativePath(path);
 	std::error_code error;
-	const auto      size = std::filesystem::file_size(path, error);
-	if (signature.empty() || error || size < sizeof(Magic) + sizeof(uint32_t) + FooterSize)
+	const auto      size = std::filesystem::file_size(native, error);
+	if (signature.empty() || native.empty() || error ||
+	    size < sizeof(Magic) + sizeof(uint32_t) + FooterSize)
 		return nullptr;
 	std::unique_ptr<PipelineBinaries> store(new PipelineBinaries);
 	store->m_device = device;
-	store->m_file   = LocalPlatform::OpenFileForReading(Common::PathToString(path).c_str());
+	store->m_file   = LocalPlatform::OpenFileForReading(Common::PathToString(native).c_str());
 	const auto read = [&](uint64_t offset, void* data, size_t bytes) {
 		return LocalPlatform::ReadScratchFile(store->m_file, offset, data, bytes);
 	};
@@ -269,8 +273,7 @@ PipelineBinaryWriter::PipelineBinaryWriter(vk::Device device): m_device(device) 
 	if (const char* claims = std::getenv("KYTY_PRECOMPILE_CLAIMS");
 	    claims != nullptr && *claims != 0) {
 		m_claims = claims;
-		std::error_code error;
-		std::filesystem::create_directories(m_claims, error);
+		PipelineCacheFile::CreateDirectories(m_claims);
 	}
 }
 
@@ -283,7 +286,8 @@ static std::string ClaimName(const PipelineBinaries::Key& key) {
 
 bool PipelineBinaryWriter::Claimed(const PipelineBinaries::Key& key) const {
 	std::error_code error;
-	if (m_claims.empty() || !std::filesystem::exists(m_claims / ClaimName(key), error))
+	if (m_claims.empty() ||
+	    !std::filesystem::exists(PipelineCacheFile::NativePath(m_claims / ClaimName(key)), error))
 		return false;
 	m_claimed.fetch_add(1, std::memory_order_relaxed);
 	return true;
@@ -292,7 +296,8 @@ bool PipelineBinaryWriter::Claimed(const PipelineBinaries::Key& key) const {
 // After the binaries are held (never before: a shard that is split keeps what it saved, and its
 // halves compile the rest).
 void PipelineBinaryWriter::Claim(const PipelineBinaries::Key& key) const {
-	if (!m_claims.empty()) std::ofstream(m_claims / ClaimName(key), std::ios::binary);
+	if (!m_claims.empty())
+		std::ofstream(PipelineCacheFile::NativePath(m_claims / ClaimName(key)), std::ios::binary);
 }
 
 bool PipelineBinaryWriter::Capture(const PipelineBinaries::Key& key, vk::Pipeline pipeline,
@@ -397,9 +402,11 @@ size_t PipelineBinaryWriter::Pipelines() const {
 bool PipelineBinaryWriter::Save(const std::filesystem::path& file_path,
                                 const std::string&           signature) const {
 	std::lock_guard lock(m_mutex);
-	std::error_code error;
-	std::filesystem::create_directories(file_path.parent_path(), error);
-	std::ofstream file(file_path, std::ios::binary | std::ios::trunc);
+	// The native form past MAX_PATH too: there a logical path does not open, and every write below
+	// would be lost.
+	PipelineCacheFile::CreateDirectories(file_path.parent_path());
+	std::ofstream file(PipelineCacheFile::NativePath(file_path),
+	                   std::ios::binary | std::ios::trunc);
 	const auto    signature_size = static_cast<uint32_t>(signature.size());
 	file.write(Magic, sizeof(Magic));
 	file.write(reinterpret_cast<const char*>(&signature_size), sizeof(signature_size));

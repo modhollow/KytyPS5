@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineAttemptTraceRuntime.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -194,6 +195,7 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>&    descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits stage, bool native_bindings) {
+	PipelineAttemptTrace::Scope trace(PipelineAttemptTrace::Operation::DescriptorBindings);
 	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
 	for (const auto& binding: program.bindings.descriptors) {
 		auto type = NativeDescriptorType(binding.kind);
@@ -210,7 +212,8 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>&    de
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings,
                                    bool native_bindings) {
-	uint32_t descriptor_count = 0;
+	PipelineAttemptTrace::Scope trace(PipelineAttemptTrace::Operation::DescriptorLayout);
+	uint32_t                    descriptor_count = 0;
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 	}
@@ -224,8 +227,10 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	                          : vk::DescriptorSetLayoutCreateFlags {};
 	create.bindingCount = static_cast<uint32_t>(bindings.size());
 	create.pBindings    = bindings.data();
-	EXIT_IF(graphics.device.createDescriptorSetLayout(
-	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+	const auto result = graphics.device.createDescriptorSetLayout(&create, nullptr,
+	                                                              &pipeline.descriptor_set_layout);
+	trace.VulkanResult(result);
+	EXIT_IF(result != vk::Result::eSuccess);
 }
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryCapture.inc"
@@ -306,7 +311,9 @@ void CreatePipelineInternal(
     const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
     bool native_bindings, PipelineBuild build) {
-	const bool ps_active = ps_input_info != nullptr;
+	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::GraphicsContext(
+	    vs_input_info, ps_input_info, build, graphics.pipeline_cache_control_enabled));
+	const bool                           ps_active = ps_input_info != nullptr;
 	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
 	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
 	                        rendering.stencil_format != vk::Format::eUndefined;
@@ -567,8 +574,12 @@ void CreatePipelineInternal(
 			     " set_layouts=1 push_constants=%" PRIu32 "\n",
 			     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
 		}
-		result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-		                                              &pipeline.pipeline_layout);
+		{
+			PipelineAttemptTrace::Scope trace(PipelineAttemptTrace::Operation::PipelineLayout);
+			result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+			                                              &pipeline.pipeline_layout);
+			trace.VulkanResult(result);
+		}
 		NotePipelineKeyLayout(pipeline.pipeline_layout, descriptor_bindings,
 		                      pipeline.uses_push_descriptors);
 		if (graphics_debug_dump_enabled()) {
@@ -679,6 +690,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
                             PipelineBuild build, bool native_bindings) {
+	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::ComputeContext(
+	    input_info, build, graphics.pipeline_cache_control_enabled));
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -716,8 +729,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 		LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
 		     1u);
-		const auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-		                                                         &pipeline.pipeline_layout);
+		const auto result = [&] {
+			PipelineAttemptTrace::Scope trace(PipelineAttemptTrace::Operation::PipelineLayout);
+			const auto value = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+			                                                        &pipeline.pipeline_layout);
+			trace.VulkanResult(value);
+			return value;
+		}();
 		NotePipelineKeyLayout(pipeline.pipeline_layout, descriptor_bindings,
 		                      pipeline.uses_push_descriptors);
 		LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineAttemptTraceRuntime.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheFile.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
@@ -1437,13 +1438,20 @@ struct PipelineCache::PendingGraphicsPipeline {
 class PipelineCache::CompileWorkers {
 public:
 	// background: below-normal priority off the render CPUs, and jobs still queued at shutdown are
-	// dropped.
-	explicit CompileWorkers(uint32_t count, bool background = false, const char* label = "compile")
+	// dropped. efficient: background at reduced power too (LocalPlatform::MakeCompileThread), for
+	// work nothing waits for.
+	explicit CompileWorkers(uint32_t count, bool background = false, const char* label = "compile",
+	                        bool efficient = false)
 	    : m_background(background), m_label(label) {
 		for (uint32_t i = 0; i < count; i++)
-			m_threads.emplace_back([this] {
-				if (m_background)
-					LocalPlatform::MakeBackgroundThread(std::getenv("KYTY_RENDER_CPUS"));
+			m_threads.emplace_back([this, count, efficient, first = i == 0] {
+				if (m_background) {
+					const bool throttled = LocalPlatform::MakeCompileThread(
+					    std::getenv("KYTY_RENDER_CPUS"), efficient);
+					if (efficient && first)
+						PipelineCacheLog("Compile workers ({}): {} threads, reduced power {}",
+						                 m_label, count, throttled ? "on" : "off");
+				}
 				Run();
 			});
 	}
@@ -1541,8 +1549,11 @@ PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 
 PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
 	if (m_optimize_workers == nullptr) {
+		// Nothing waits for these (the unoptimized pipeline draws until PromoteOptimized): at
+		// reduced power, a cooler CPU for optimized pipelines that arrive a little later.
+		// KYTY_COMPILE_EFFICIENCY=0 runs them at full power.
 		m_optimize_workers = std::make_unique<CompileWorkers>(
-		    std::max(2u, std::thread::hardware_concurrency() / 4u), true, "optimize");
+		    std::max(2u, std::thread::hardware_concurrency() / 4u), true, "optimize", true);
 	}
 	return *m_optimize_workers;
 }
@@ -1574,14 +1585,16 @@ void PipelineCache::BuildOptimized(Pipeline& pipeline, std::function<void(Pipeli
 	auto layouts       = pipeline;
 	layouts.pipeline   = nullptr;
 	layouts.optimized  = nullptr;
-	OptimizeWorkers().Push(
-	    [this, optimized = pipeline.optimized, layouts, build = std::move(build)]() mutable {
-		    if (!m_stopping.load(std::memory_order_relaxed)) build(layouts);
-		    optimized->pipeline = layouts.pipeline;
-		    optimized->done.store(true, std::memory_order_release);
-		    m_optimized_builds.fetch_add(1, std::memory_order_release);
-		    MainPipelineDone();
-	    });
+	OptimizeWorkers().Push([this, optimized = pipeline.optimized, layouts,
+	                        build = std::move(build)]() mutable {
+		PipelineAttemptTraceRuntime::CallerScope trace_caller(
+		    PipelineAttemptTrace::Caller::OptimizeWorker, PipelineAttemptTrace::DriverCache::Main);
+		if (!m_stopping.load(std::memory_order_relaxed)) build(layouts);
+		optimized->pipeline = layouts.pipeline;
+		optimized->done.store(true, std::memory_order_release);
+		m_optimized_builds.fetch_add(1, std::memory_order_release);
+		MainPipelineDone();
+	});
 }
 
 void PipelineCache::PromoteFinished() {
@@ -1854,6 +1867,8 @@ void PipelineCache::WarmPipelines() {
 
 	std::atomic<size_t> next {0}, compiled {0};
 	const auto          work = [&] {
+		PipelineAttemptTraceRuntime::CallerScope trace_caller(
+		    PipelineAttemptTrace::Caller::Warmup, PipelineAttemptTrace::DriverCache::Main);
 		for (size_t n; (n = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
 			if (std::chrono::steady_clock::now() >= programs.warm_deadline) return;
 			auto& job = jobs[n];
@@ -2048,9 +2063,21 @@ void PipelineCache::InitializeDriverCache() {
 		}
 		m_driver_cache_key = key;
 	}
-	m_driver_cache_path =
-	    PipelineCacheFile::Path(title_id, PipelineCacheRoot(),
-	                            DriverCacheIdentity(m_graphics.GetPhysicalDeviceProperties()));
+	// Resolve the driver root once; a later working-directory change must not move its files.
+	auto cache_root = PipelineCacheRoot();
+#ifdef _WIN32
+	cache_root = PipelineCacheFile::NativePath(cache_root);
+#else
+	std::error_code root_error;
+	cache_root = std::filesystem::absolute(cache_root, root_error);
+	if (root_error) cache_root.clear();
+#endif
+	if (cache_root.empty()) {
+		PipelineCacheLog("Vulkan pipeline cache: disabled (cache root could not be resolved)");
+		return;
+	}
+	m_driver_cache_path = PipelineCacheFile::Path(
+	    title_id, cache_root, DriverCacheIdentity(m_graphics.GetPhysicalDeviceProperties()));
 	// The launcher keeps one cache across emulator builds: pipelines of changed shaders pile up in
 	// it, so past 1 GiB (one build's warmup is ~130 MB) it starts over.
 	m_driver_cache =
@@ -2105,8 +2132,9 @@ void PipelineCache::InitializeDriverCache() {
 // XXH3, the payload; one past `limit` bytes starts over. Null: the cache is disabled.
 vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& file_path,
                                                  uint64_t limit, size_t& loaded_size) {
-	const auto path         = Common::PathToString(file_path);
-	const bool cache_exists = Common::File::IsFileExisting(file_path);
+	const auto path = Common::PathToString(file_path);
+	const bool cache_exists =
+	    Common::File::IsFileExisting(PipelineCacheFile::NativePath(file_path));
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
 	} else {
@@ -2183,7 +2211,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	const auto prefix = PipelineCacheFile::Prefix(
 	    payload, DriverCacheIdentity(m_graphics.GetPhysicalDeviceProperties()), maximum);
 	if (prefix.empty()) return false;
-	if (!Common::File::CreateDirectories(file_path.parent_path())) {
+	if (!PipelineCacheFile::CreateDirectories(file_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return false;
 	}
@@ -2192,7 +2220,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
+	if (file.Create(PipelineCacheFile::NativePath(temp_path))) {
 		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
 		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
 	}
@@ -2201,7 +2229,7 @@ bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesyst
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
 	    !PipelineCacheFile::Replace(temp_path, file_path)) {
 		std::error_code cleanup_error;
-		std::filesystem::remove(temp_path, cleanup_error);
+		std::filesystem::remove(PipelineCacheFile::NativePath(temp_path), cleanup_error);
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(file_path));
 		return false;
@@ -2635,11 +2663,22 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				        static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
 			    },
 			    SlowLog::HitchThreshold());
+			PipelineAttemptTraceRuntime::CallerScope trace_caller(
+			    table ? PipelineAttemptTrace::Caller::TableWorker
+			          : PipelineAttemptTrace::Caller::NativeWorker,
+			    table ? PipelineAttemptTrace::DriverCache::Table
+			          : PipelineAttemptTrace::DriverCache::Main);
+			PipelineAttemptTraceRuntime::Session attempt_trace(
+			    PipelineAttemptTraceRuntime::GraphicsContext(
+			        job->vs_input_info, job->ps_active ? &job->ps_input_info : nullptr,
+			        PipelineBuild::Full, m_graphics.pipeline_cache_control_enabled));
 			CreatePipelineInternal(
 			    m_graphics, *job->pipeline, job->rendering, job->vertex_input, job->vs_input_info,
 			    job->vertex_program, job->ps_active ? &job->ps_input_info : nullptr,
 			    job->pixel_program, job->static_params,
 			    table ? TablePipelineCache() : m_driver_cache, job->native_bindings);
+			PipelineAttemptTrace::Scope trace_bookkeeping(
+			    PipelineAttemptTrace::Operation::Bookkeeping);
 			if (table)
 				TablePipelineDone();
 			else
@@ -2671,9 +2710,15 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto                  cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto                               build = FirstBuild(m_graphics);
+	PipelineAttemptTraceRuntime::CallerScope trace_caller(PipelineAttemptTrace::Caller::Foreground,
+	                                                      PipelineAttemptTrace::DriverCache::Main);
+	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::GraphicsContext(
+	    vs_input_info, ps_input_info, build, m_graphics.pipeline_cache_control_enabled));
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
+	                       m_driver_cache, native_bindings, build);
+	PipelineAttemptTrace::Scope trace_bookkeeping(PipelineAttemptTrace::Operation::Bookkeeping);
 	MainPipelineDone();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -2739,10 +2784,16 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		                static_cast<unsigned long long>(compute_program.id));
 	    },
 	    SlowLog::HitchThreshold());
-	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
-	auto                  cached = std::make_unique<Pipeline>();
+	LiveCensus::WaitScope                    compiling(LiveCensus::WaitCompile);
+	auto                                     cached = std::make_unique<Pipeline>();
+	const auto                               build  = FirstBuild(m_graphics);
+	PipelineAttemptTraceRuntime::CallerScope trace_caller(PipelineAttemptTrace::Caller::Foreground,
+	                                                      PipelineAttemptTrace::DriverCache::Main);
+	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::ComputeContext(
+	    input_info, build, m_graphics.pipeline_cache_control_enabled));
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
-	                       FirstBuild(m_graphics));
+	                       build);
+	PipelineAttemptTrace::Scope trace_bookkeeping(PipelineAttemptTrace::Operation::Bookkeeping);
 	MainPipelineDone();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -2805,8 +2856,14 @@ PipelineCache::TryCreateComputePipeline(const ShaderComputeInputInfo& input_info
 			        static_cast<unsigned long long>(job->input_info.stage.program->shader_hash));
 		    },
 		    SlowLog::HitchThreshold());
+		PipelineAttemptTraceRuntime::CallerScope trace_caller(
+		    PipelineAttemptTrace::Caller::TableWorker, PipelineAttemptTrace::DriverCache::Table);
+		PipelineAttemptTraceRuntime::Session attempt_trace(
+		    PipelineAttemptTraceRuntime::ComputeContext(job->input_info, PipelineBuild::Full,
+		                                                m_graphics.pipeline_cache_control_enabled));
 		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module,
 		                       TablePipelineCache(), PipelineBuild::Full, true);
+		PipelineAttemptTrace::Scope trace_bookkeeping(PipelineAttemptTrace::Operation::Bookkeeping);
 		TablePipelineDone();
 		job->done.store(true, std::memory_order_release);
 	});

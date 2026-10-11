@@ -563,6 +563,20 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_cache_upgrade_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/PipelineCacheUpgradeTests.cpp"
+    "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCacheFile.cpp"
+)
+target_link_libraries(pipeline_cache_upgrade_tests PRIVATE common xxhash fmt::fmt)
+target_include_directories(pipeline_cache_upgrade_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_cache_native_read_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/PipelineCacheNativeReadTests.cpp"
+    "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCacheFile.cpp"
+)
+target_link_libraries(pipeline_cache_native_read_tests PRIVATE common xxhash fmt::fmt)
+target_include_directories(pipeline_cache_native_read_tests PRIVATE ${inc_headers})
+
 add_executable(static_cache_readiness_tests EXCLUDE_FROM_ALL
     "${KYTY_TESTS_DIR}/StaticCacheReadinessTests.cpp"
     "${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
@@ -575,7 +589,7 @@ if(LINUX)
     target_link_libraries(static_cache_readiness_tests PRIVATE ${CMAKE_DL_LIBS})
 endif()
 find_package(Threads REQUIRED)
-target_link_libraries(static_cache_readiness_tests PRIVATE xxhash fmt::fmt Vulkan::Headers Threads::Threads)
+target_link_libraries(static_cache_readiness_tests PRIVATE common xxhash fmt::fmt Vulkan::Headers Threads::Threads)
 target_include_directories(static_cache_readiness_tests PRIVATE ${inc_headers})
 if(KYTY_CLANG_CL)
     target_compile_options(static_cache_readiness_tests PRIVATE /Gy)
@@ -591,11 +605,37 @@ add_executable(pipeline_capture_contract_tests EXCLUDE_FROM_ALL
     "${KYTY_TESTS_DIR}/PipelineCaptureContractTests.cpp")
 target_link_libraries(pipeline_capture_contract_tests PRIVATE Vulkan::Headers)
 target_include_directories(pipeline_capture_contract_tests PRIVATE "${KYTY_SOURCE_DIR}")
+# Vulkan-Hpp as the emulator configures it (vulkanCommon.h): no exceptions, which Linux builds turn off.
+target_compile_definitions(pipeline_capture_contract_tests PRIVATE VULKAN_HPP_NO_EXCEPTIONS)
 
 add_executable(pipeline_build_attempt_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineBuildAttemptTests.cpp")
 target_link_libraries(pipeline_build_attempt_tests PRIVATE Vulkan::Headers)
 target_include_directories(pipeline_build_attempt_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_compile_definitions(pipeline_build_attempt_tests PRIVATE VULKAN_HPP_NO_EXCEPTIONS)
+
+add_executable(compile_thread_power_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CompileThreadPowerTests.cpp"
+	"${KYTY_SOURCE_DIR}/local/local-platform.cpp")
+find_package(Threads REQUIRED)
+target_link_libraries(compile_thread_power_tests PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+target_include_directories(compile_thread_power_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(WIN32)
+	target_link_libraries(compile_thread_power_tests PRIVATE dxgi)
+endif()
+
+# Paths past MAX_PATH are a Windows matter.
+if(WIN32)
+	add_executable(pipeline_binaries_long_path_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/PipelineBinariesLongPathTests.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineBinaries.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCacheFile.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+		"${KYTY_SOURCE_DIR}/local/local-platform.cpp")
+	target_link_libraries(pipeline_binaries_long_path_tests PRIVATE common xxhash fmt::fmt Vulkan::Headers
+	                      Threads::Threads dxgi)
+	target_include_directories(pipeline_binaries_long_path_tests PRIVATE ${inc_headers} "${KYTY_SOURCE_DIR}/local")
+endif()
 
 add_executable(dispatch_batch_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DispatchBatchPolicyTests.cpp"
@@ -755,10 +795,25 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME cache_upgrade_compatibility COMMAND $<TARGET_FILE:pipeline_cache_upgrade_tests>)
+	add_test(NAME cache_native_read COMMAND $<TARGET_FILE:pipeline_cache_native_read_tests>)
 	add_test(NAME static_cache_readiness COMMAND $<TARGET_FILE:static_cache_readiness_tests>)
 	add_test(NAME pipeline_capture_contract COMMAND $<TARGET_FILE:pipeline_capture_contract_tests>)
 	add_test(NAME pipeline_build_attempts COMMAND $<TARGET_FILE:pipeline_build_attempt_tests>)
 	set_tests_properties(pipeline_build_attempts PROPERTIES TIMEOUT 15)
+	add_test(NAME compile_thread_power COMMAND $<TARGET_FILE:compile_thread_power_tests>)
+	set_tests_properties(compile_thread_power PROPERTIES TIMEOUT 15)
+	if(WIN32)
+		add_test(NAME pipeline_binaries_long_path COMMAND $<TARGET_FILE:pipeline_binaries_long_path_tests>)
+		set_tests_properties(pipeline_binaries_long_path PROPERTIES TIMEOUT 15)
+		find_program(KYTY_PWSH pwsh)
+		if(KYTY_PWSH)
+			add_test(NAME precompile_plan
+			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
+			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/PrecompilePlanTests.ps1")
+			set_tests_properties(precompile_plan PROPERTIES TIMEOUT 60)
+		endif()
+	endif()
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -842,8 +897,11 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		pipeline_cache_upgrade_tests
+		pipeline_cache_native_read_tests
 		static_cache_readiness_tests
 		pipeline_build_attempt_tests
+		compile_thread_power_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
