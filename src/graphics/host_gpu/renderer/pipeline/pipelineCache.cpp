@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineAttemptTraceRuntime.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheFile.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
@@ -1574,14 +1575,16 @@ void PipelineCache::BuildOptimized(Pipeline& pipeline, std::function<void(Pipeli
 	auto layouts       = pipeline;
 	layouts.pipeline   = nullptr;
 	layouts.optimized  = nullptr;
-	OptimizeWorkers().Push(
-	    [this, optimized = pipeline.optimized, layouts, build = std::move(build)]() mutable {
-		    if (!m_stopping.load(std::memory_order_relaxed)) build(layouts);
-		    optimized->pipeline = layouts.pipeline;
-		    optimized->done.store(true, std::memory_order_release);
-		    m_optimized_builds.fetch_add(1, std::memory_order_release);
-		    MainPipelineDone();
-	    });
+	OptimizeWorkers().Push([this, optimized = pipeline.optimized, layouts,
+	                        build = std::move(build)]() mutable {
+		PipelineAttemptTraceRuntime::CallerScope trace_caller(
+		    PipelineAttemptTrace::Caller::OptimizeWorker, PipelineAttemptTrace::DriverCache::Main);
+		if (!m_stopping.load(std::memory_order_relaxed)) build(layouts);
+		optimized->pipeline = layouts.pipeline;
+		optimized->done.store(true, std::memory_order_release);
+		m_optimized_builds.fetch_add(1, std::memory_order_release);
+		MainPipelineDone();
+	});
 }
 
 void PipelineCache::PromoteFinished() {
@@ -1854,6 +1857,8 @@ void PipelineCache::WarmPipelines() {
 
 	std::atomic<size_t> next {0}, compiled {0};
 	const auto          work = [&] {
+		PipelineAttemptTraceRuntime::CallerScope trace_caller(
+		    PipelineAttemptTrace::Caller::Warmup, PipelineAttemptTrace::DriverCache::Main);
 		for (size_t n; (n = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
 			if (std::chrono::steady_clock::now() >= programs.warm_deadline) return;
 			auto& job = jobs[n];
@@ -2648,11 +2653,22 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				        static_cast<unsigned long long>(pixel != nullptr ? pixel->shader_hash : 0));
 			    },
 			    SlowLog::HitchThreshold());
+			PipelineAttemptTraceRuntime::CallerScope trace_caller(
+			    table ? PipelineAttemptTrace::Caller::TableWorker
+			          : PipelineAttemptTrace::Caller::NativeWorker,
+			    table ? PipelineAttemptTrace::DriverCache::Table
+			          : PipelineAttemptTrace::DriverCache::Main);
+			PipelineAttemptTraceRuntime::Session attempt_trace(
+			    PipelineAttemptTraceRuntime::GraphicsContext(
+			        job->vs_input_info, job->ps_active ? &job->ps_input_info : nullptr,
+			        PipelineBuild::Full, m_graphics.pipeline_cache_control_enabled));
 			CreatePipelineInternal(
 			    m_graphics, *job->pipeline, job->rendering, job->vertex_input, job->vs_input_info,
 			    job->vertex_program, job->ps_active ? &job->ps_input_info : nullptr,
 			    job->pixel_program, job->static_params,
 			    table ? TablePipelineCache() : m_driver_cache, job->native_bindings);
+			PipelineAttemptTrace::Scope trace_bookkeeping(
+			    PipelineAttemptTrace::Operation::Bookkeeping);
 			if (table)
 				TablePipelineDone();
 			else
@@ -2684,9 +2700,15 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto                  cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto                               build = FirstBuild(m_graphics);
+	PipelineAttemptTraceRuntime::CallerScope trace_caller(PipelineAttemptTrace::Caller::Foreground,
+	                                                      PipelineAttemptTrace::DriverCache::Main);
+	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::GraphicsContext(
+	    vs_input_info, ps_input_info, build, m_graphics.pipeline_cache_control_enabled));
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
+	                       m_driver_cache, native_bindings, build);
+	PipelineAttemptTrace::Scope trace_bookkeeping(PipelineAttemptTrace::Operation::Bookkeeping);
 	MainPipelineDone();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -2752,10 +2774,16 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 		                static_cast<unsigned long long>(compute_program.id));
 	    },
 	    SlowLog::HitchThreshold());
-	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
-	auto                  cached = std::make_unique<Pipeline>();
+	LiveCensus::WaitScope                    compiling(LiveCensus::WaitCompile);
+	auto                                     cached = std::make_unique<Pipeline>();
+	const auto                               build  = FirstBuild(m_graphics);
+	PipelineAttemptTraceRuntime::CallerScope trace_caller(PipelineAttemptTrace::Caller::Foreground,
+	                                                      PipelineAttemptTrace::DriverCache::Main);
+	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::ComputeContext(
+	    input_info, build, m_graphics.pipeline_cache_control_enabled));
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
-	                       FirstBuild(m_graphics));
+	                       build);
+	PipelineAttemptTrace::Scope trace_bookkeeping(PipelineAttemptTrace::Operation::Bookkeeping);
 	MainPipelineDone();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -2818,8 +2846,14 @@ PipelineCache::TryCreateComputePipeline(const ShaderComputeInputInfo& input_info
 			        static_cast<unsigned long long>(job->input_info.stage.program->shader_hash));
 		    },
 		    SlowLog::HitchThreshold());
+		PipelineAttemptTraceRuntime::CallerScope trace_caller(
+		    PipelineAttemptTrace::Caller::TableWorker, PipelineAttemptTrace::DriverCache::Table);
+		PipelineAttemptTraceRuntime::Session attempt_trace(
+		    PipelineAttemptTraceRuntime::ComputeContext(job->input_info, PipelineBuild::Full,
+		                                                m_graphics.pipeline_cache_control_enabled));
 		CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module,
 		                       TablePipelineCache(), PipelineBuild::Full, true);
+		PipelineAttemptTrace::Scope trace_bookkeeping(PipelineAttemptTrace::Operation::Bookkeeping);
 		TablePipelineDone();
 		job->done.store(true, std::memory_order_release);
 	});

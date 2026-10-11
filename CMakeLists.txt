@@ -605,11 +605,14 @@ add_executable(pipeline_capture_contract_tests EXCLUDE_FROM_ALL
     "${KYTY_TESTS_DIR}/PipelineCaptureContractTests.cpp")
 target_link_libraries(pipeline_capture_contract_tests PRIVATE Vulkan::Headers)
 target_include_directories(pipeline_capture_contract_tests PRIVATE "${KYTY_SOURCE_DIR}")
+# Vulkan-Hpp as the emulator configures it (vulkanCommon.h): no exceptions, which Linux builds turn off.
+target_compile_definitions(pipeline_capture_contract_tests PRIVATE VULKAN_HPP_NO_EXCEPTIONS)
 
 add_executable(pipeline_build_attempt_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineBuildAttemptTests.cpp")
 target_link_libraries(pipeline_build_attempt_tests PRIVATE Vulkan::Headers)
 target_include_directories(pipeline_build_attempt_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_compile_definitions(pipeline_build_attempt_tests PRIVATE VULKAN_HPP_NO_EXCEPTIONS)
 
 add_executable(dispatch_batch_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DispatchBatchPolicyTests.cpp"

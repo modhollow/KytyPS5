@@ -10,8 +10,18 @@ static vk::Result CapturePipelineBinaries(GraphicContext&          graphics,
 	if (graphics.static_pipeline_cache != nullptr && graphics.pipeline_cache_control_enabled) {
 		auto lookup = info;
 		lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
-		if (create(graphics.static_pipeline_cache, lookup) == vk::Result::eSuccess) {
-			if (writer->Capture(key, nullptr, &info)) return vk::Result::eSuccess;
+		if (PipelineAttemptTrace::Invoke(PipelineAttemptTrace::Operation::BinaryCaptureProbe,
+		                                 PipelineAttemptTrace::Cache::Static,
+		                                 graphics.static_pipeline_cache, lookup,
+		                                 create) == vk::Result::eSuccess) {
+			bool captured;
+			{
+				PipelineAttemptTrace::Scope trace(
+				    PipelineAttemptTrace::Operation::BinaryCaptureStore);
+				captured = writer->Capture(key, nullptr, &info);
+				trace.BooleanResult(captured);
+			}
+			if (captured) return vk::Result::eSuccess;
 			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 		}
 		pipeline.pipeline = nullptr;
@@ -22,9 +32,14 @@ static vk::Result CapturePipelineBinaries(GraphicContext&          graphics,
 	flags.pNext = info.pNext;
 	info.pNext  = &flags;
 	// Vulkan binary capture requires a null application pipeline cache (VUID09617).
-	const auto result = create(nullptr, info);
-	if (result == vk::Result::eSuccess && !writer->Capture(key, pipeline.pipeline)) {
-		std::printf("Pipeline binaries: the driver gave none for a pipeline\n");
+	const auto result =
+	    PipelineAttemptTrace::Invoke(PipelineAttemptTrace::Operation::BinaryCaptureCreate,
+	                                 PipelineAttemptTrace::Cache::None, nullptr, info, create);
+	if (result == vk::Result::eSuccess) {
+		PipelineAttemptTrace::Scope trace(PipelineAttemptTrace::Operation::BinaryCaptureStore);
+		const bool                  captured = writer->Capture(key, pipeline.pipeline);
+		trace.BooleanResult(captured);
+		if (!captured) std::printf("Pipeline binaries: the driver gave none for a pipeline\n");
 	}
 	return result;
 }

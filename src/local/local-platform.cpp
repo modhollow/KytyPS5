@@ -522,6 +522,18 @@ double ThreadCpuSeconds(uint64_t handle) {
 	return handle != 0 ? HandleCpuSeconds(reinterpret_cast<HANDLE>(handle)) : 0;
 }
 
+bool CurrentThreadCpuNanoseconds(uint64_t* nanoseconds) {
+	if (nanoseconds == nullptr) return false;
+	FILETIME created {}, exited {}, kernel {}, user {};
+	if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) == 0) return false;
+	const uint64_t kernel_ticks =
+	    (static_cast<uint64_t>(kernel.dwHighDateTime) << 32u) | kernel.dwLowDateTime;
+	const uint64_t user_ticks =
+	    (static_cast<uint64_t>(user.dwHighDateTime) << 32u) | user.dwLowDateTime;
+	*nanoseconds = (kernel_ticks + user_ticks) * 100u;
+	return true;
+}
+
 uint64_t CurrentThreadCycles() {
 	ULONG64 cycles = 0;
 	return QueryThreadCycleTime(GetCurrentThread(), &cycles) != 0 ? cycles : 0;
@@ -880,6 +892,21 @@ double ThreadCpuSeconds(uint64_t handle) {
 	clockid_t clock {};
 	if (pthread_getcpuclockid(static_cast<pthread_t>(handle), &clock) != 0) return 0;
 	return ClockSeconds(clock);
+}
+
+bool CurrentThreadCpuNanoseconds(uint64_t* nanoseconds) {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+	if (nanoseconds == nullptr) return false;
+	timespec now {};
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0)
+		return false;
+	*nanoseconds =
+	    static_cast<uint64_t>(now.tv_sec) * 1000000000u + static_cast<uint64_t>(now.tv_nsec);
+	return true;
+#else
+	(void)nanoseconds;
+	return false;
+#endif
 }
 
 uint64_t CurrentThreadCycles() {

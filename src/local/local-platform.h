@@ -29,6 +29,9 @@ bool SetProcessDefaultCpuList(const char* list);
 // Opaque handle of the calling thread for ThreadCpuSeconds (valid while the thread runs).
 uint64_t CurrentThreadHandle();
 double   ThreadCpuSeconds(uint64_t handle);
+// Kernel + user time of the calling thread, in ns units (OS accounting granularity).
+// false means unavailable; zero is a valid measured value. No thread handle is opened.
+bool CurrentThreadCpuNanoseconds(uint64_t* nanoseconds);
 // The calling thread's run time in TSC ticks (Windows: QueryThreadCycleTime; exact, unlike the
 // tick-sampled ThreadCpuSeconds). Linux: 0.
 uint64_t CurrentThreadCycles();
