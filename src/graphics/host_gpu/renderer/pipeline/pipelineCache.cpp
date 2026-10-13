@@ -1840,7 +1840,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	m_program_cache->push_job = [this](std::function<void()> job) {
 		TableWorkers().Push(std::move(job));
 	};
+	// Not the emulator's driver cache in the static precompile: it compiles through caches of its
+	// own, and a driver cache the game filled hands the driver its trained compression dictionary,
+	// whose binaries only this PC reads (every one would be left out).
+#ifdef KYTY_STATIC_PRECOMPILE
+	PipelineCacheLog(
+	    "Vulkan pipeline cache: the emulator's is not loaded by the static precompile");
+#else
 	InitializeDriverCache();
+#endif
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
 	InitializeStaticCache(false);
 	// Not in the static precompile: a shell that ran the game passes its KYTY_SHADER_WARMUP(_ONLY)
