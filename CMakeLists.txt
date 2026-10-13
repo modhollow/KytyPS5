@@ -842,6 +842,10 @@ if(BUILD_TESTING)
 			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
 			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/PrecompileShardSchedulerTests.ps1")
 			set_tests_properties(precompile_shard_scheduler PROPERTIES TIMEOUT 30)
+			add_test(NAME run_windows_background
+			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
+			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/RunWindowsBackgroundTests.ps1")
+			set_tests_properties(run_windows_background PROPERTIES TIMEOUT 60)
 			add_test(NAME launcher_module_path
 			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
 			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/LauncherModulePathTests.ps1")
