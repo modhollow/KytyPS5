@@ -661,38 +661,60 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		});
 	}
 	if (create_pipelines) {
+		using ComputeVariants = std::vector<std::pair<const Permutation*, bool>>;
+		const auto compute_variants = [&](size_t n) {
+			ComputeVariants out;
+			for (const auto& permutation: first[n])
+				out.emplace_back(permutation.get(), false);
+			if (exact[n] && std::ranges::none_of(first[n], [&](const auto& permutation) {
+				    return spirv_hash(permutation.get()) == spirv_hash(exact[n].get());
+			    }))
+				out.emplace_back(exact[n].get(), false);
+			if (table_first[n]) {
+				std::unordered_set<uint64_t> made {spirv_hash(table_first[n].get())};
+				out.emplace_back(table_first[n].get(), true);
+				for (auto found = table_more.lower_bound({static_cast<uint32_t>(n), 0});
+				     found != table_more.end() && found->first.first == n; ++found)
+					if (found->second && made.insert(spirv_hash(found->second.get())).second)
+						out.emplace_back(found->second.get(), true);
+			}
+			return out;
+		};
+		const auto compute_job = [&](size_t seed, const ComputeVariants& variants, size_t begin,
+		                             size_t count) {
+			if (writer != nullptr && writer->LeftOut() != 0) return;
+			LocalShaderWarmup::Record input;
+			if (!decode(static_cast<uint32_t>(seed), input)) return;
+			for (size_t i = begin; i < begin + count; ++i) {
+				const auto [permutation, native] = variants[i];
+				input.compute.stage.program = &permutation->program;
+				Pipeline pipeline;
+				const auto start = std::chrono::steady_clock::now();
+				CreatePipelineInternal(m_graphics, pipeline, input.compute,
+				                       permutation->handle.module, driver_cache,
+				                       PipelineBuild::Full, native);
+				destroy(pipeline);
+				created_one(start, words_of(permutation), input.hash, 0);
+			}
+		};
+		std::vector<ComputeVariants> compute;
+		std::vector<PrecompileSchedule::ComputeUnit> compute_units;
+		if (binaries) {
+			compute.resize(seed_words.size());
+			compute_units = PrecompileSchedule::ComputeUnits(
+			    seed_words.size(), shard, shards, [&](size_t seed) {
+				    if (stage_of(seed) == ShaderType::Compute)
+					    compute[seed] = compute_variants(seed);
+				    return compute[seed].size();
+			    });
+		}
 		const auto pipeline_job = [&](size_t n) {
 			// Once binaries are left out, the rest would be too: for a smaller shard.
 			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0)) return;
 			if (n < seed_words.size()) {
 				if (stage_of(n) != ShaderType::Compute) return;
-				LocalShaderWarmup::Record input;
-				if (!decode(static_cast<uint32_t>(n), input)) return;
-				// (`native`: a table mode program's pipeline, TryCreateComputePipeline's.)
-				const auto create = [&](const Permutation& permutation, bool native) {
-					input.compute.stage.program = &permutation.program;
-					Pipeline   pipeline;
-					const auto start = std::chrono::steady_clock::now();
-					CreatePipelineInternal(m_graphics, pipeline, input.compute,
-					                       permutation.handle.module, driver_cache,
-					                       PipelineBuild::Full, native);
-					destroy(pipeline);
-					created_one(start, words_of(&permutation), input.hash, 0);
-				};
-				for (const auto& permutation: first[n])
-					create(*permutation, false);
-				if (exact[n] && std::ranges::none_of(first[n], [&](const auto& permutation) {
-					    return spirv_hash(permutation.get()) == spirv_hash(exact[n].get());
-				    }))
-					create(*exact[n], false);
-				if (table_first[n]) {
-					std::unordered_set<uint64_t> made {spirv_hash(table_first[n].get())};
-					create(*table_first[n], true);
-					for (auto found = table_more.lower_bound({static_cast<uint32_t>(n), 0});
-					     found != table_more.end() && found->first.first == n; ++found)
-						if (found->second && made.insert(spirv_hash(found->second.get())).second)
-							create(*found->second, true);
-				}
+				const auto variants = compute_variants(n);
+				compute_job(n, variants, 0, variants.size());
 				return;
 			}
 			const auto&               recipe = recipes[n - seed_words.size()];
@@ -788,7 +810,14 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 			    if (count == 0) return;
 			    const auto phase_start   = std::chrono::steady_clock::now();
 			    const auto phase_created = created.load(std::memory_order_relaxed);
-			    parallel(count, [&](size_t i) { pipeline_job(begin + i); });
+			    if (binaries && begin == 0 && count == seed_words.size()) {
+				    parallel(compute_units.size(), [&](size_t i) {
+					    const auto& unit = compute_units[i];
+					    compute_job(unit.seed, compute[unit.seed], unit.begin, unit.count);
+				    });
+			    } else {
+				    parallel(count, [&](size_t i) { pipeline_job(begin + i); });
+			    }
 			    if (binaries) {
 				    PipelineCacheLog("Shader seeds: {} phase created {} pipelines in {} ms ({} "
 				                     "captured, {} left out)",
