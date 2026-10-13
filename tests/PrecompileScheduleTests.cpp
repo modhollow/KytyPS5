@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/precompileSchedule.h"
+#include "local/use-rank.h"
 
 #include <algorithm>
 #include <array>
@@ -280,6 +281,63 @@ void ComputeSizePriority() {
 	                      {{3, 0, 1}, {1, 1, 1}, {1, 0, 1}, {1, 2, 1}, {3, 1, 1}}),
 	      "priority reads individual variant sizes, preserves stable ties and excludes other shards");
 }
+
+// --shard-blocks: contiguous slices that cover every item once, in order, and split into the two
+// halves precompile-windows.ps1 runs again (2i and 2i + 1 of 2n); every n-th keeps i and i + n of 2n.
+void ShardBlocks() {
+	using Libs::Graphics::PrecompileSchedule::InShard;
+	for (size_t count: {0u, 1u, 7u, 100u, 16007u}) {
+		for (size_t shards: {1u, 3u, 8u, 161u}) {
+			size_t covered = 0, last_shard = 0;
+			bool   once = true, ordered = true, halves = true, modulo_halves = true;
+			for (size_t n = 0; n < count; n++) {
+				size_t owners = 0, owner = 0;
+				for (size_t i = 0; i < shards; i++) {
+					if (InShard(n, count, i, shards, true)) {
+						owners++;
+						owner = i;
+					}
+				}
+				once     = once && owners == 1;
+				ordered  = ordered && owner >= last_shard;
+				last_shard = owner;
+				covered += owners;
+				halves = halves && (InShard(n, count, 2 * owner, 2 * shards, true) ||
+				                    InShard(n, count, 2 * owner + 1, 2 * shards, true));
+				const auto m  = n % shards;
+				modulo_halves = modulo_halves && (InShard(n, count, m, 2 * shards, false) ||
+				                                  InShard(n, count, m + shards, 2 * shards, false));
+			}
+			Check(once && covered == count, "every item is in exactly one block");
+			Check(ordered, "blocks keep the list's order");
+			Check(halves, "a block's items are in its two halves of 2n");
+			Check(modulo_halves, "every n-th: shard i's items are in i or i + n of 2n");
+		}
+	}
+	// The first shard of a ranked list holds its first items.
+	Check(InShard(0, 1000, 0, 10, true) && InShard(99, 1000, 0, 10, true) &&
+	          !InShard(100, 1000, 0, 10, true),
+	      "shard 0 of 10 is the first tenth");
+	std::vector<size_t> units;
+	for (const auto& unit: Libs::Graphics::PrecompileSchedule::ComputeUnits(
+	         10, 1, 5, [](size_t) { return size_t {1}; }, true))
+		units.push_back(unit.seed);
+	Check(units == std::vector<size_t>({2, 3}), "compute units of a block are its slice");
+}
+
+// --make-hints order: what more recordings use first, then what one used earlier; the rest as added.
+void HintRank() {
+	ShaderHints::UseRank rank;
+	// Recording 0 (content): entries 0..5 in order. Recording 1 (--rank): 4, then 2. Recording 2: 2.
+	for (uint32_t id = 0; id < 6; id++) rank.Use(id, 0, id, 6);
+	rank.Use(4, 1, 0, 10);
+	rank.Use(2, 1, 5, 10);
+	rank.Use(2, 2, 3, 4);
+	rank.Use(ShaderHints::UseRank::None, 2, 0, 4);
+	rank.Use(4, 1, 7, 10); // a second use in the same recording counts once
+	Check(rank.Order(6) == std::vector<uint32_t>({2, 4, 0, 1, 3, 5}), "hints ranked by recordings, then first use");
+	Check(ShaderHints::UseRank {}.Order(3) == std::vector<uint32_t>({0, 1, 2}), "unused entries keep their order");
+}
 } // namespace
 
 int main() {
@@ -290,5 +348,7 @@ int main() {
 	ComputeVariantMembership();
 	ComputeVariantLimits();
 	ComputeSizePriority();
+	ShardBlocks();
+	HintRank();
 	return failures != 0 ? 1 : 0;
 }

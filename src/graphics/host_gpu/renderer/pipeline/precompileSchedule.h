@@ -8,14 +8,24 @@ struct ComputeUnit {
 	size_t seed, begin, count;
 };
 
+// Whether item `index` of `count` belongs to shard `shard` of `shards`: every n-th item, or with
+// `blocks` the shard-th contiguous slice, so that a ranked list's first shards hold its first items
+// (a precompile stopped early has them). Either way shard i of n is exactly shards i and i + n of
+// 2n (every n-th), or 2i and 2i + 1 of 2n (slices): a shard that left pipelines out runs again as
+// two.
+inline bool InShard(size_t index, size_t count, size_t shard, size_t shards, bool blocks) {
+	if (!blocks) return index % shards == shard;
+	return count != 0 && index * shards / count == shard;
+}
+
 // Original seed indices still determine shard membership. The executor joins
 // this bounded queue before graphics capture starts.
 template <class VariantCount>
 std::vector<ComputeUnit> ComputeUnits(size_t seeds, size_t shard, size_t shards,
-                                      VariantCount variants) {
+                                      VariantCount variants, bool blocks = false) {
 	std::vector<ComputeUnit> units;
 	for (size_t seed = 0; seed < seeds; ++seed) {
-		if (seed % shards != shard) continue;
+		if (!InShard(seed, seeds, shard, shards, blocks)) continue;
 		const auto count = variants(seed);
 		for (size_t variant = 0; variant < count; ++variant)
 			units.push_back({seed, variant, 1});

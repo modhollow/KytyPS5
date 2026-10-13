@@ -4,7 +4,9 @@
 #include "common/file.h"
 #include "shader-warmup-cache.h"
 #include "static-seeds.h"
+#include "use-rank.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -117,6 +119,15 @@ struct Unique {
 	Lists                                       entries;
 	std::unordered_multimap<uint64_t, uint32_t> index;
 
+	// The entry's id, or NoShader where it has none.
+	uint32_t Find(const std::vector<uint32_t>& words) const {
+		const auto [begin, end] = index.equal_range(Hash(words));
+		for (auto it = begin; it != end; ++it) {
+			if (entries[it->second] == words) return it->second;
+		}
+		return NoShader;
+	}
+
 	uint32_t Add(std::vector<uint32_t> words) {
 		const auto hash         = Hash(words);
 		const auto [begin, end] = index.equal_range(hash);
@@ -225,14 +236,17 @@ std::string GameId(const fs::path& game) {
 }
 
 int Make(const fs::path& out, const fs::path& seeds, const std::vector<fs::path>& recordings,
-         const std::string& game_id) {
+         const std::vector<fs::path>& rank, const std::string& game_id) {
 	Lists                                        seed_records;
 	std::unordered_map<Code, uint32_t, CodeHash> programs;
 	if (game_id.empty() || !ReadPrograms(seeds, seed_records, programs)) return 1;
-	Unique hints, pipelines;
-	size_t other_records = 0, other_pipelines = 0;
-	for (const auto& recording: recordings) {
-		Lists records, recipes;
+	Unique  hints, pipelines;
+	UseRank hint_uses, pipeline_uses;
+	size_t  other_records = 0, other_pipelines = 0;
+	for (size_t source = 0; source < recordings.size() + rank.size(); source++) {
+		const bool  ranking   = source >= recordings.size();
+		const auto& recording = ranking ? rank[source - recordings.size()] : recordings[source];
+		Lists       records, recipes;
 		if (!Cache::ReadInputs(recording, records, recipes)) {
 			std::fprintf(stderr, "%s: not a warmup recording or a seed file\n",
 			             Utf8(recording).c_str());
@@ -242,19 +256,39 @@ int Make(const fs::path& out, const fs::path& seeds, const std::vector<fs::path>
 		for (size_t i = 0; i < records.size(); i++) {
 			Record record;
 			if (!Decode(records[i], record) || !programs.contains(CodeOf(record))) {
-				other_records++;
+				if (!ranking) other_records++;
 				continue;
 			}
-			numbers[i] = hints.Add(HintOf(std::move(record)));
+			auto hint  = HintOf(std::move(record));
+			numbers[i] = ranking ? hints.Find(hint) : hints.Add(std::move(hint));
+			hint_uses.Use(numbers[i], source, i, records.size());
 		}
-		for (auto& recipe: recipes) {
-			if (Renumber(recipe, numbers)) {
-				pipelines.Add(std::move(recipe));
-			} else {
-				other_pipelines++;
+		for (size_t i = 0; i < recipes.size(); i++) {
+			auto& recipe = recipes[i];
+			if (!Renumber(recipe, numbers)) {
+				if (!ranking) other_pipelines++;
+				continue;
 			}
+			pipeline_uses.Use(ranking ? pipelines.Find(recipe) : pipelines.Add(std::move(recipe)),
+			                  source, i, recipes.size());
 		}
 	}
+	// Ranked by use; the pipelines' shaders renumbered to the ranked records.
+	const auto            record_order   = hint_uses.Order(hints.entries.size());
+	const auto            pipeline_order = pipeline_uses.Order(pipelines.entries.size());
+	std::vector<uint32_t> ranked_number(record_order.size());
+	Lists                 ranked_hints, ranked_pipelines;
+	for (uint32_t i = 0; i < record_order.size(); i++) {
+		ranked_number[record_order[i]] = i;
+		ranked_hints.push_back(std::move(hints.entries[record_order[i]]));
+	}
+	for (const auto id: pipeline_order) {
+		auto recipe = std::move(pipelines.entries[id]);
+		Renumber(recipe, ranked_number);
+		ranked_pipelines.push_back(std::move(recipe));
+	}
+	hints.entries          = std::move(ranked_hints);
+	pipelines.entries      = std::move(ranked_pipelines);
 	const auto        body = Body(hints.entries, pipelines.entries);
 	const auto        size = body.size() * sizeof(uint32_t);
 	std::vector<char> packed(ZSTD_compressBound(size));

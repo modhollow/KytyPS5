@@ -68,7 +68,8 @@ using Libs::Graphics::PipelineCache;
 static int Usage() {
 	std::fprintf(
 	    stderr,
-	    "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
+	    "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n> "
+	    "[--shard-blocks]] "
 	    "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines]\n"
 	    "       kyty_shader_precompile --game <dir> --merge [--prune]\n"
 	    "       kyty_shader_precompile --game <dir> --seeds <file> --status\n"
@@ -78,7 +79,7 @@ static int Usage() {
 	    "       kyty_shader_precompile --game <dir> --param <file>\n"
 	    "       kyty_shader_precompile --game <dir> --seeds <file> --make-hints <file> --recorded "
 	    "<file> "
-	    "[--recorded <file>...]\n"
+	    "[--recorded <file>...] [--rank <file>...]\n"
 	    "       kyty_shader_precompile --game <dir> --seeds <file> --apply-hints <file> --out "
 	    "<file>\n"
 	    "(<dir>: the game folder, or the game packed into a ZArchive: a .zar file)\n");
@@ -103,6 +104,8 @@ int main(int argc, char* argv[]) {
 	std::filesystem::path param_copy;              // --param
 	std::filesystem::path make_hints, apply_hints; // --make-hints, --apply-hints
 	std::vector<std::filesystem::path> recordings; // --recorded (--make-hints)
+	std::vector<std::filesystem::path>
+	    rank; // --rank (--make-hints): recordings that only order the hints
 	options.threads = std::max(1u, std::thread::hardware_concurrency());
 	for (int i = 1; i < argc; i++) {
 		const std::string_view arg   = argv[i];
@@ -126,6 +129,10 @@ int main(int argc, char* argv[]) {
 			validate = true;
 		} else if (arg == "--static-inputs") {
 			options.static_inputs = true;
+		} else if (arg == "--shard-blocks") {
+			// Shard i of n: the i-th contiguous slice of the seeds and of the recipes, not every
+			// n-th (a ranked seed file's first shards hold what play needs first).
+			options.shard_blocks = true;
 		} else if (value == nullptr) {
 			return Usage();
 		} else if (arg == "--game") {
@@ -151,6 +158,8 @@ int main(int argc, char* argv[]) {
 			apply_hints = argv[++i];
 		} else if (arg == "--recorded") {
 			recordings.emplace_back(argv[++i]);
+		} else if (arg == "--rank") {
+			rank.emplace_back(argv[++i]);
 		} else if (arg == "--states") {
 			make_seeds.states = argv[++i];
 			seed_option       = true;
@@ -197,7 +206,7 @@ int main(int argc, char* argv[]) {
 	if (!make_hints.empty() || !apply_hints.empty()) {
 		const bool make   = !make_hints.empty();
 		const bool inputs = make ? !recordings.empty() && options.out.empty()
-		                         : !options.out.empty() && recordings.empty();
+		                         : !options.out.empty() && recordings.empty() && rank.empty();
 		if (game.empty() || options.seeds.empty() || merge || status || !make_seeds.out.empty() ||
 		    seed_option || (make && !apply_hints.empty()) || !inputs)
 			return Usage();
@@ -207,12 +216,12 @@ int main(int argc, char* argv[]) {
 			             game.string().c_str());
 			return 1;
 		}
-		const int code = make ? ShaderHints::Make(make_hints, options.seeds, recordings, id)
+		const int code = make ? ShaderHints::Make(make_hints, options.seeds, recordings, rank, id)
 		                      : ShaderHints::Apply(apply_hints, options.seeds, options.out, id);
 		std::fflush(nullptr);
 		std::_Exit(code);
 	}
-	if (!recordings.empty()) return Usage();
+	if (!recordings.empty() || !rank.empty()) return Usage();
 	// The seed file from the game's files: no Vulkan device, none of the emulator's subsystems.
 	if (!make_seeds.out.empty()) {
 		if (game.empty() || merge || status || !options.seeds.empty()) return Usage();

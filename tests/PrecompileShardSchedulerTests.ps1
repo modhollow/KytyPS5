@@ -42,7 +42,14 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
     if ($position -lt 0) { throw 'Worker was launched without its shard identity' }
     $i, $n = [int[]]($arguments[$position + 1] -split '/')
     if ($i -lt 0 -or $i -ge $n) { throw 'Invalid worker shard' }
-    $items = @($script:fixture.Items | Where-Object { $_ % $n -eq $i })
+    # The production membership rule (precompileSchedule.h InShard): every n-th, or contiguous slices.
+    $all = @($script:fixture.Items)
+    $items = if ($arguments -contains '--shard-blocks') {
+        @(for ($k = 0; $k -lt $all.Count; $k++) { if ([math]::Floor($k * $n / $all.Count) -eq $i) { $all[$k] } })
+    } else {
+        @($all | Where-Object { $_ % $n -eq $i })
+    }
+    $script:fixture.Blocks.Add([pscustomobject]@{ Name = $name; Blocks = ($arguments -contains '--shard-blocks') })
     $script:fixture.Launched.Add([pscustomobject]@{ I = $i; N = $n; Name = $name })
     $exit = 0
     if ($script:fixture.Kind -eq 'always-partial' -or
@@ -70,6 +77,7 @@ function Invoke-SchedulerCase([string]$kind, [int]$shards, [int]$jobs,
         Recorded = [Collections.Generic.List[string]]::new()
         Items = $items; RecordedPipelines = $recordedPipelines
         Launched = [Collections.Generic.List[object]]::new()
+        Blocks = [Collections.Generic.List[object]]::new()
         Completed = [Collections.Generic.List[int]]::new()
     }
     $Seeds = 'fixture.seeds'
@@ -89,7 +97,7 @@ function Invoke-SchedulerCase([string]$kind, [int]$shards, [int]$jobs,
     $errorText = ''
     # Fixtures for the recorded shards, in this scope only.
     function Get-SeedPipelines([string]$file) { return $script:fixture.RecordedPipelines }
-    function Test-Path([string]$path) { return $path -eq 'fixture-recorded.seeds' }
+    function Test-Path([string]$path) { return $path -in @('fixture-recorded.seeds', 'other\fixture.seeds') }
     try { . $scheduler } catch { $errorText = $_.Exception.Message }
     return [pscustomobject]@{
         Error = $errorText; Finished = $finished; Split = $split; Merge = ($mergeArguments -join ' ')
@@ -98,6 +106,7 @@ function Invoke-SchedulerCase([string]$kind, [int]$shards, [int]$jobs,
         Starts = $script:fixture.Starts; PeakPending = $script:fixture.PeakPending
         Completed = @($script:fixture.Completed.ToArray())
         Launched = @($script:fixture.Launched.ToArray())
+        Blocks = @($script:fixture.Blocks.ToArray())
     }
 }
 
@@ -147,6 +156,30 @@ try {
     Check (($names[3..6] | Where-Object { $_ -like '*-fixture' }).Count -eq 4) (
         "Seed shards did not follow the recorded ones: $($names -join ', ')")
 
+    # Recorded play's shards are contiguous slices of the (ranked) recorded file; the seeds' every n-th.
+    Check ((@($r.Blocks | Where-Object { $_.Name -like '*fixture-recorded' -and $_.Blocks }).Count -eq 3) -and
+        (@($r.Blocks | Where-Object { $_.Name -like '*-fixture' -and $_.Blocks }).Count -eq 0)) (
+        "Recorded shards were not contiguous or seed shards were: $(($r.Blocks | ForEach-Object { "$($_.Name)=$($_.Blocks)" }) -join ', ')")
+
+    # A contiguous slice that left pipelines out runs again as its two halves (2i, 2i + 1 of 2n),
+    # which together cover it exactly.
+    $r = Invoke-SchedulerCase 'partial-success' 4 3 @(0..63) 100 'fixture-recorded.seeds' $true 350
+    Check (!$r.Error) "Contiguous split workload failed: $($r.Error)"
+    Check ((($r.Completed | Sort-Object) -join ',') -eq ((0..63) -join ',')) (
+        "Contiguous split descendants lost or duplicated work: $(($r.Completed | Sort-Object) -join ',')")
+    $names = @($r.Launched | ForEach-Object Name)
+    Check ($names -contains 'shard0of8b-fixture-recorded' -and @($names | Where-Object { $_ -notlike 'shard*b-fixture-recorded' }).Count -eq 0) (
+        "Contiguous halves were not named as contiguous shards: $($names -join ', ')")
+
+    # A list naming an every-n-th shard never skips the contiguous shard with the same i/n.
+    $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 'fixture-recorded.seeds' $true 250 0 0 @('shard0of3-fixture-recorded')
+    Check (!$r.Error -and $r.Skipped -eq 0 -and @($r.Launched | ForEach-Object Name) -contains 'shard0of3b-fixture-recorded') (
+        "An every-n-th name skipped a contiguous shard (skipped $($r.Skipped))")
+
+    # Tiers that share a file stem are refused (their shard files would collide).
+    $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 'other\fixture.seeds' $false 250
+    Check ($r.Error -match 'must not be named like the seed file') "Same-stem tiers were not refused: $($r.Error)"
+
     # -RecordedOnly: only recorded play's shards.
     $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 'fixture-recorded.seeds' $true 250
     $names = @($r.Launched | ForEach-Object Name)
@@ -186,12 +219,12 @@ try {
 
     # Shards an earlier run finished are not run again, and the merge then keeps the store (no prune).
     $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 'fixture-recorded.seeds' $false 250 0 0 @(
-        'shard0of3-fixture-recorded', 'shard1of3-fixture-recorded')
+        'shard0of3b-fixture-recorded', 'shard1of3b-fixture-recorded')
     $names = @($r.Launched | ForEach-Object Name)
-    Check (!$r.Error -and $r.Skipped -eq 2 -and ($names -notcontains 'shard0of3-fixture-recorded') -and $names.Count -eq 5) (
+    Check (!$r.Error -and $r.Skipped -eq 2 -and ($names -notcontains 'shard0of3b-fixture-recorded') -and $names.Count -eq 5) (
         "Finished shards ran again: $($names -join ', ') (skipped $($r.Skipped))")
     Check ($r.Merge -eq '--merge' -and !$r.Partial) "A run that kept earlier shards pruned them or was partial: $($r.Merge)"
-    Check ($r.DoneAdded.Count -eq 5 -and $r.DoneAdded -contains 'shard2of3-fixture-recorded') (
+    Check ($r.DoneAdded.Count -eq 5 -and $r.DoneAdded -contains 'shard2of3b-fixture-recorded') (
         "Finished shards were not recorded as done: $($r.DoneAdded -join ', ')")
 
     # A shard that splits again on a later run: the half that run finished is kept.

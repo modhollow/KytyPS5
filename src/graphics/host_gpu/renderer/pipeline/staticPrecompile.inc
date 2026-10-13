@@ -191,8 +191,15 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		    recipe.compute == LocalShaderWarmup::NoShader)
 			recipes.push_back(recipe);
 	}
-	// This shard's work: every n-th compute seed and graphics recipe, and the programs they need.
-	const auto        mine = [&](size_t n) { return n % shards == shard; };
+	// This shard's work: every n-th compute seed and graphics recipe (--shard-blocks: the shard-th
+	// slice of each list), and the programs they need.
+	// n: a seed's index, or the seed count plus a recipe's.
+	const auto mine = [&](size_t n) {
+		if (!args.shard_blocks) return n % shards == shard;
+		const auto seeds = seed_words.size();
+		return n < seeds ? PrecompileSchedule::InShard(n, seeds, shard, shards, true)
+		                 : PrecompileSchedule::InShard(n - seeds, recipes.size(), shard, shards, true);
+	};
 	std::vector<bool> wanted(seed_words.size());
 	for (size_t i = 0; i < seed_words.size(); i++) {
 		const auto stage = stage_of(i);
@@ -706,7 +713,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				    if (stage_of(seed) == ShaderType::Compute)
 					    compute[seed] = compute_variants(seed);
 				    return compute[seed].size();
-			    });
+			    },
+			    args.shard_blocks);
 			PrecompileSchedule::PrioritizeComputeUnits(compute_units, threads > 1,
 			    [&](const auto& unit) { return words_of(compute[unit.seed][unit.begin].first); });
 		}

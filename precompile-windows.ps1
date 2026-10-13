@@ -367,12 +367,18 @@ if ($InputsOnly) {
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
 $pending = [System.Collections.Generic.LinkedList[object]]::new()
-function Get-ShardName([string]$seedFile, [string]$shard) {
-	'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
+# A shard's name (its logs, its NVIDIA cache, the finished-shards list): contiguous slices (b) and every n-th
+# hold different items under the same i/n.
+function Get-ShardName([string]$seedFile, [string]$shard, [bool]$blocks) {
+	'shard' + ($shard -replace '/', 'of') + $(if ($blocks) { 'b' } else { '' }) + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
 }
 # What recorded play uses first (exactly the pipelines the game asks for: a fifth of the work), then every
 # shader of the game as the seeds guess it: a run stopped part way has the ones that matter most.
 $recordedShards = $ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)
+# The precompiler names a shard's file after its seed file's stem and i/n only: two tiers must not share a stem.
+if ($recordedShards -and [IO.Path]::GetFileNameWithoutExtension($Recorded) -eq [IO.Path]::GetFileNameWithoutExtension($Seeds)) {
+	throw "the recorded seed file must not be named like the seed file ($([IO.Path]::GetFileName($Recorded)))"
+}
 $doneFile = Join-Path $CacheRoot "static-v1\$gameId.done"
 $doneInputs = Get-ShardInputs @($Exe, $Seeds, $(if ($recordedShards) { $Recorded }))
 $done = if ($ShardLimit -le 0) { Read-DoneShards $doneFile $doneInputs } else { [Collections.Generic.HashSet[string]]::new() }
@@ -380,17 +386,19 @@ $skipped = 0
 $queue = @()
 if ($recordedShards) {
 	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
+	# Contiguous slices (--shard-blocks): a recorded file ranked by use has what play needs first in its
+	# first shards, which a run stopped early (-Minutes) then holds.
 	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
-	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Recorded, "$i/$count") }
+	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Recorded, "$i/$count", $true) }
 } elseif ($RecordedOnly -and $ShardLimit -le 0) {
 	Write-Host 'precompile: no recorded play or hints for this game version: every shader instead (-RecordedOnly ignored)'
 }
 if (!$RecordedOnly -or !$recordedShards) {
 	$count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
-	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Seeds, "$i/$Shards") }
+	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Seeds, "$i/$Shards", $false) }
 }
 foreach ($entry in $queue) {
-	if ($done.Contains((Get-ShardName $entry[0] $entry[1]))) { $skipped++ } else { [void]$pending.AddLast($entry) }
+	if ($done.Contains((Get-ShardName $entry[0] $entry[1] $entry[2]))) { $skipped++ } else { [void]$pending.AddLast($entry) }
 }
 if ($skipped) { Write-Host "precompile: $skipped shards an earlier run finished are kept, not run again" }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
@@ -411,14 +419,16 @@ while (($pending.Count -and !$budgetStopped) -or $running.Count) {
 				$running.Count, $pending.Count)
 			break
 		}
-		$seedFile, $shard = $pending.First.Value
+		$seedFile, $shard, $blocks = $pending.First.Value
 		$pending.RemoveFirst()
-		$name = Get-ShardName $seedFile $shard
-		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")))
+		$name = Get-ShardName $seedFile $shard $blocks
+		$arguments = @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")
+		if ($blocks) { $arguments += '--shard-blocks' }
+		$running[$name] = @($seedFile, $shard, (Start-Precompile $name $arguments), $blocks)
 	}
 	Start-Sleep -Milliseconds 250
 	foreach ($name in @($running.Keys)) {
-		$seedFile, $shard, $process = $running[$name]
+		$seedFile, $shard, $process, $blocks = $running[$name]
 		if (!$process.HasExited) { continue }
 		$running.Remove($name)
 		Remove-NvidiaCache $process
@@ -427,10 +437,12 @@ while (($pending.Count -and !$budgetStopped) -or $running.Count) {
 			if ($n -ge 65536) { throw "$name cannot be split further; logs: $logName" }
 			# Resolve smaller retries before expanding all remaining parents. A FIFO
 			# frontier can grow for hours without reaching a completed or terminal child.
-			# Both modulo halves remain scheduled; partial shard data stays available.
-			# Halves an earlier run finished are kept (a shard that splits splits again).
-			foreach ($half in "$($i + $n)/$(2 * $n)", "$i/$(2 * $n)") {
-				if ($done.Contains((Get-ShardName $seedFile $half))) { $skipped++ } else { [void]$pending.AddFirst(@($seedFile, $half)) }
+			# Both halves remain scheduled (every n-th: i and i + n of 2n; contiguous slices: 2i and
+			# 2i + 1); partial shard data stays available. Halves an earlier run finished are kept
+			# (a shard that splits splits again).
+			$halves = if ($blocks) { "$(2 * $i + 1)/$(2 * $n)", "$(2 * $i)/$(2 * $n)" } else { "$($i + $n)/$(2 * $n)", "$i/$(2 * $n)" }
+			foreach ($half in $halves) {
+				if ($done.Contains((Get-ShardName $seedFile $half $blocks))) { $skipped++ } else { [void]$pending.AddFirst(@($seedFile, $half, $blocks)) }
 			}
 			$split++
 		} elseif ($process.ExitCode -ne 0) {
