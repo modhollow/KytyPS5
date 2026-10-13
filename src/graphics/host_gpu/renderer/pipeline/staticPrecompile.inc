@@ -707,6 +707,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 					    compute[seed] = compute_variants(seed);
 				    return compute[seed].size();
 			    });
+			PrecompileSchedule::PrioritizeComputeUnits(compute_units, threads > 1,
+			    [&](const auto& unit) { return words_of(compute[unit.seed][unit.begin].first); });
 		}
 		const auto pipeline_job = [&](size_t n) {
 			// Once binaries are left out, the rest would be too: for a smaller shard.

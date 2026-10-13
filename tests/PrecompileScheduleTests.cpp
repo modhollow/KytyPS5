@@ -227,6 +227,59 @@ void ComputeVariantLimits() {
 	Check(run(0, 1, 1, 0) == std::pair {false, size_t {0}},
 	      "fully retained variant work completes without new captures even at zero capacity");
 }
+
+void ComputeSizePriority() {
+	using Libs::Graphics::PrecompileSchedule::ComputeUnit;
+	std::vector<size_t> costs(12, 10);
+	costs.insert(costs.end(), {100, 100, 100, 80});
+	const auto original = Libs::Graphics::PrecompileSchedule::ComputeUnits(
+	    costs.size(), 0, 1, [](size_t) { return size_t {1}; });
+	const auto run = [&](const auto& units) {
+		std::array<size_t, 3> workers {};
+		for (const auto& unit: units)
+			*std::min_element(workers.begin(), workers.end()) += costs[unit.seed];
+		return *std::max_element(workers.begin(), workers.end());
+	};
+	Check(run(original) == 220, "FIFO control leaves large compute work behind cheap jobs");
+	auto prioritized = original;
+	const auto words = [&](const ComputeUnit& unit) { return costs[unit.seed] * 10; };
+	Libs::Graphics::PrecompileSchedule::PrioritizeComputeUnits(prioritized, true, words);
+	Check(run(prioritized) < run(original),
+	      "module-size priority reduces the bounded queue's expensive final straggler");
+	std::set<std::array<size_t, 3>> expected_keys, keys;
+	for (const auto& unit: original)
+		expected_keys.insert({unit.seed, unit.begin, unit.count});
+	for (const auto& unit: prioritized)
+		Check(unit.count == 1 && keys.insert({unit.seed, unit.begin, unit.count}).second,
+		      "priority keeps each selected compute unit exactly once");
+	Check(keys == expected_keys, "priority preserves the exact original selected compute units");
+	std::vector<size_t> equal_size_order;
+	for (const auto& unit: prioritized)
+		if (costs[unit.seed] == 100) equal_size_order.push_back(unit.seed);
+	Check(equal_size_order == std::vector<size_t>({12, 13, 14}),
+	      "equal module sizes keep original deterministic unit order");
+	auto serial = original;
+	Libs::Graphics::PrecompileSchedule::PrioritizeComputeUnits(serial, false, words);
+	for (size_t i = 0; i < original.size(); ++i)
+		Check(serial[i].seed == original[i].seed && serial[i].begin == original[i].begin &&
+		          serial[i].count == original[i].count,
+		      "single-worker preparation keeps the original order");
+	std::vector<ComputeUnit> empty;
+	Libs::Graphics::PrecompileSchedule::PrioritizeComputeUnits(empty, true, words);
+	Check(empty.empty(), "empty priority queue stays empty");
+
+	const std::vector<std::vector<size_t>> modules {{999}, {40, 80, 40}, {999}, {200, 40}, {999}};
+	auto variants = Libs::Graphics::PrecompileSchedule::ComputeUnits(
+	    modules.size(), 1, 2, [&](size_t seed) { return modules[seed].size(); });
+	Libs::Graphics::PrecompileSchedule::PrioritizeComputeUnits(
+	    variants, true, [&](const auto& unit) { return modules[unit.seed][unit.begin]; });
+	std::vector<std::array<size_t, 3>> selected;
+	for (const auto& unit: variants)
+		selected.push_back({unit.seed, unit.begin, unit.count});
+	Check(selected == std::vector<std::array<size_t, 3>>(
+	                      {{3, 0, 1}, {1, 1, 1}, {1, 0, 1}, {1, 2, 1}, {3, 1, 1}}),
+	      "priority reads individual variant sizes, preserves stable ties and excludes other shards");
+}
 } // namespace
 
 int main() {
@@ -236,5 +289,6 @@ int main() {
 	ComputeVariantBalance();
 	ComputeVariantMembership();
 	ComputeVariantLimits();
+	ComputeSizePriority();
 	return failures != 0 ? 1 : 0;
 }
