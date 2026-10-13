@@ -121,7 +121,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|compile_thread_power|pipeline_late_build|vulkan_recording|precompile_plan|pipeline_binaries_long_path)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(launcher_module_path|launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|compile_thread_power|pipeline_late_build|vulkan_recording|precompile_plan|pipeline_binaries_long_path)$"
 
       - name: Install
         shell: cmd

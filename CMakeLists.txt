@@ -819,6 +819,10 @@ if(BUILD_TESTING)
 			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
 			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/PrecompilePlanTests.ps1")
 			set_tests_properties(precompile_plan PROPERTIES TIMEOUT 60)
+			add_test(NAME launcher_module_path
+			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
+			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/LauncherModulePathTests.ps1")
+			set_tests_properties(launcher_module_path PROPERTIES TIMEOUT 60)
 		endif()
 	endif()
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
