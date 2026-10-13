@@ -7,6 +7,10 @@
 #                                         needed (the driver copies a whole .bin into memory: GBs)
 #   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 2 threads each, as many as the allowed
 #                                         cores less one hold with their SMT siblings)
+#   .\precompile-windows.ps1 -RecordedOnly  only what recorded play uses (the specializations of recorded play, or the
+#                                         release's hints): about a fifth of the time; the rest is compiled when the
+#                                         game first needs it, or by a full run later (which keeps these);
+#                                         run-windows.ps1 -Prompt still offers that full run (<title>_<version>.partial)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -45,6 +49,7 @@ param(
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
 	[switch]$InputsOnly,
+	[switch]$RecordedOnly,
 	# Every allowed CPU (the processes still below normal priority), instead of the cores less one.
 	# Overrides EcoQoS.
 	[switch]$FullSpeed,
@@ -302,12 +307,19 @@ if ($InputsOnly) {
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
 $pending = [System.Collections.Generic.LinkedList[object]]::new()
-$count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
-for ($i = 0; $i -lt $count; $i++) { [void]$pending.AddLast(@($Seeds, "$i/$Shards")) }
-if ($ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)) {
+# What recorded play uses first (exactly the pipelines the game asks for: a fifth of the work), then every
+# shader of the game as the seeds guess it: a run stopped part way has the ones that matter most.
+$recordedShards = $ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)
+if ($recordedShards) {
 	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
 	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
 	for ($i = 0; $i -lt $count; $i++) { [void]$pending.AddLast(@($Recorded, "$i/$count")) }
+} elseif ($RecordedOnly -and $ShardLimit -le 0) {
+	Write-Host 'precompile: no recorded play or hints for this game version: every shader instead (-RecordedOnly ignored)'
+}
+if (!$RecordedOnly -or !$recordedShards) {
+	$count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
+	for ($i = 0; $i -lt $count; $i++) { [void]$pending.AddLast(@($Seeds, "$i/$Shards")) }
 }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
@@ -355,7 +367,18 @@ if ($ShardLimit -gt 0) {
 	Write-Host ("{0} of {1} shards done in {2:hh\:mm\:ss} ({3} split); not merged (-ShardLimit)" -f $finished, $Shards, ((Get-Date) - $begin), $split)
 	return
 }
-Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
+# -RecordedOnly keeps what an earlier full run made (--prune would keep only this run's), and marks the
+# cache as partial: the store is newer than the seeds, so --status calls it current, and run-windows.ps1
+# -Prompt would stop offering the full run. A full run removes the mark.
+$mergeArguments = if ($RecordedOnly -and $recordedShards) { @('--merge') } else { @('--merge', '--prune') }
+$partial = Join-Path $CacheRoot "static-v1\$gameId.partial"
+Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
+if ($RecordedOnly -and $recordedShards) {
+	New-Item -ItemType Directory -Force (Split-Path $partial) | Out-Null
+	Set-Content $partial 'precompile-windows.ps1 -RecordedOnly: only what recorded play uses (a full run removes this)'
+} else {
+	Remove-Item $partial -ErrorAction SilentlyContinue
+}
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\$gameId.bin", "$CacheRoot\static-v1\driver-v1\*\$gameId.binaries" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1

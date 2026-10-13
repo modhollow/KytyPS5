@@ -12,13 +12,14 @@ $assignments = @($ast.FindAll({
 }, $true))
 $begin = @($assignments | Where-Object { $_.Left.Extent.Text -eq '$pending' })[0]
 $end = @($assignments | Where-Object {
-    $_.Left.Extent.Text -eq '$env:KYTY_PRECOMPILE_CLAIMS' -and
-    $_.Right.Extent.Text -eq '$null' -and $_.Extent.StartOffset -gt $begin.Extent.StartOffset
+    $_.Left.Extent.Text -eq '$mergeArguments' -and $_.Extent.StartOffset -gt $begin.Extent.StartOffset
 })[0]
 if (!$begin -or !$end) { throw 'Production scheduler boundaries not found' }
 $text = [IO.File]::ReadAllText($source)
-$scheduler = [scriptblock]::Create($text.Substring(
-    $begin.Extent.StartOffset, $end.Extent.EndOffset - $begin.Extent.StartOffset))
+# The scheduler through the final merge's arguments, without the -ShardLimit early return between them.
+$region = $text.Substring($begin.Extent.StartOffset, $end.Extent.EndOffset - $begin.Extent.StartOffset)
+$region = $region -replace '(?ms)^if \(\$ShardLimit -gt 0\) \{\r?\n.*?^\s*return\r?\n\}', ''
+$scheduler = [scriptblock]::Create($region)
 $failures = 0
 
 function Start-Sleep { param([int]$Milliseconds) }
@@ -50,15 +51,17 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 }
 
 function Invoke-SchedulerCase([string]$kind, [int]$shards, [int]$jobs,
-                              [int[]]$items, [int]$budget) {
+                              [int[]]$items, [int]$budget, [string]$recorded = '',
+                              [bool]$recordedOnly = $false, [int]$recordedPipelines = 0) {
     $script:fixture = [pscustomobject]@{
         Kind = $kind; Starts = 0; PeakPending = $shards; Budget = $budget
-        Items = $items
+        Items = $items; RecordedPipelines = $recordedPipelines
         Launched = [Collections.Generic.List[object]]::new()
         Completed = [Collections.Generic.List[int]]::new()
     }
     $Seeds = 'fixture.seeds'
-    $Recorded = ''
+    $Recorded = $recorded
+    $RecordedOnly = $recordedOnly
     $Shards = $shards
     $ShardLimit = 0
     $Jobs = $jobs
@@ -67,9 +70,12 @@ function Invoke-SchedulerCase([string]$kind, [int]$shards, [int]$jobs,
     $logName = 'fixture-logs'
     $begin = Get-Date
     $errorText = ''
+    # Fixtures for the recorded shards, in this scope only.
+    function Get-SeedPipelines([string]$file) { return $script:fixture.RecordedPipelines }
+    function Test-Path([string]$path) { return $path -eq 'fixture-recorded.seeds' }
     try { . $scheduler } catch { $errorText = $_.Exception.Message }
     return [pscustomobject]@{
-        Error = $errorText; Finished = $finished; Split = $split
+        Error = $errorText; Finished = $finished; Split = $split; Merge = ($mergeArguments -join ' ')
         Starts = $script:fixture.Starts; PeakPending = $script:fixture.PeakPending
         Completed = @($script:fixture.Completed.ToArray())
         Launched = @($script:fixture.Launched.ToArray())
@@ -112,6 +118,27 @@ try {
     Check (!$r.Error -and $r.Finished -eq 8) 'Empty shards no longer finish normally'
     Check ((($r.Completed | Sort-Object) -join ',') -eq '0,1,2') (
         'Empty-shard handling changed real work coverage')
+
+    # Recorded play's shards are launched before the seeds' (a run stopped early has them).
+    $r = Invoke-SchedulerCase 'success' 4 1 @(0..7) 20 'fixture-recorded.seeds' $false 250
+    $names = @($r.Launched | ForEach-Object Name)
+    Check (!$r.Error -and $r.Finished -eq 7) "Recorded plus seed shards did not all finish: $($r.Error)"
+    Check (($names[0..2] | Where-Object { $_ -like '*fixture-recorded' }).Count -eq 3) (
+        "Recorded shards were not launched first: $($names -join ', ')")
+    Check (($names[3..6] | Where-Object { $_ -like '*-fixture' }).Count -eq 4) (
+        "Seed shards did not follow the recorded ones: $($names -join ', ')")
+
+    # -RecordedOnly: only recorded play's shards.
+    $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 'fixture-recorded.seeds' $true 250
+    $names = @($r.Launched | ForEach-Object Name)
+    Check (!$r.Error -and $r.Finished -eq 3 -and ($names | Where-Object { $_ -like '*-fixture' }).Count -eq 0) (
+        "-RecordedOnly launched seed shards or missed recorded ones: $($names -join ', ')")
+    Check ($r.Merge -eq '--merge') "-RecordedOnly pruned what an earlier full run made: $($r.Merge)"
+
+    # -RecordedOnly without a recording: every shader instead.
+    $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 'missing-recorded.seeds' $true 250
+    Check (!$r.Error -and $r.Finished -eq 4) '-RecordedOnly without a recording did not fall back to the seeds'
+    Check ($r.Merge -eq '--merge --prune') "A full fallback run did not prune: $($r.Merge)"
 
     $r = Invoke-SchedulerCase 'fatal' 8 5 @(0..7) 12
     Check ($r.Error -match 'failed; logs: fixture-logs') (
