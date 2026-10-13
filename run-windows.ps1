@@ -74,6 +74,21 @@ function Initialize-Dialogs {
 }
 # A message with a button per choice and an optional check box: the chosen index (-1: closed) and
 # whether the box was checked.
+# A PowerShell command that outlives this script: started by the shell (UseShellExecute, no redirection), so it
+# inherits none of this script's handles and a caller that reads this script's output (a launcher) does not wait for
+# it to end. The command (-EncodedCommand: no command-line quoting) writes its own log.
+function Start-Detached([string]$shell, [string]$command) {
+	$start = [Diagnostics.ProcessStartInfo]::new($shell)
+	$start.UseShellExecute = $true
+	$start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+	$start.Arguments = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' +
+		[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+	[Diagnostics.Process]::Start($start)
+}
+# Text as a single-quoted PowerShell literal (every quote form PowerShell ends such a literal at is escaped).
+function ConvertTo-Literal([string]$text) {
+	"'" + [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($text) + "'"
+}
 function Show-Choice([string]$message, [string[]]$choices, [string]$checkbox = '') {
 	$form = New-Object System.Windows.Forms.Form -Property @{
 		Text = 'KytyPS5'; FormBorderStyle = 'FixedDialog'; MaximizeBox = $false; MinimizeBox = $false; StartPosition = 'CenterScreen'
@@ -573,11 +588,12 @@ if ($BackgroundPrecompile -and $shaders -and $cachePartial -and $commit -lt 36GB
 	$saved = @{}
 	foreach ($key in @($environment.Keys)) { $saved[$key] = [Environment]::GetEnvironmentVariable($key); Remove-Item "env:$key" -ErrorAction SilentlyContinue }
 	try {
-		$shell = (Get-Process -Id $PID).Path
-		$background = Start-Process -FilePath $shell -WindowStyle Hidden -PassThru -RedirectStandardOutput "$logDir\$stamp.precompile.log" `
-			-RedirectStandardError "$logDir\$stamp.precompile.err.log" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-			"`"$PSScriptRoot\precompile-windows.ps1`"", '-Game', "`"$Game`"", '-Affinity', "$mask", '-Exe', "`"$tool`"", '-Seeds', "`"$seeds`"",
-			'-CacheRoot', "`"$CacheRoot`"", '-Background', '-WhileProcess', "$($process.Id)")
+		# The script and its log by their literal paths (no wildcard resolution of [ ] in folder names).
+		$background = Start-Detached (Get-Process -Id $PID).Path (
+			"& (Get-Item -LiteralPath $(ConvertTo-Literal "$PSScriptRoot\precompile-windows.ps1")).FullName " +
+			"-Game $(ConvertTo-Literal $Game) -Affinity $mask -Exe $(ConvertTo-Literal $tool) -Seeds $(ConvertTo-Literal $seeds) " +
+			"-CacheRoot $(ConvertTo-Literal $CacheRoot) -Background -WhileProcess $($process.Id) " +
+			"*>&1 | Out-File -LiteralPath $(ConvertTo-Literal "$logDir\$stamp.precompile.log")")
 		Write-Host "shaders:  precompiling the rest in the background (pid $($background.Id); log $stamp.precompile.log)"
 	} finally {
 		foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
