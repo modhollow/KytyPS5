@@ -121,7 +121,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(launcher_module_path|launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|precompile_schedule|compile_thread_power|pipeline_late_build|vulkan_recording|precompile_plan|precompile_shard_scheduler|pipeline_binaries_long_path)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(launcher_module_path|launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|precompile_schedule|static_input_producer|compile_thread_power|pipeline_late_build|vulkan_recording|precompile_plan|precompile_shard_scheduler|pipeline_binaries_long_path)$"
 
       - name: Install
         shell: cmd
@@ -212,7 +212,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|precompile_schedule|compile_thread_power|pipeline_late_build)$'
+            -R '^(launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|precompile_schedule|static_input_producer|compile_thread_power|pipeline_late_build)$'
 
       - name: Install
         shell: bash
@@ -395,7 +395,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|precompile_schedule|compile_thread_power|pipeline_late_build|vulkan_recording)$'
+            -R '^(launcher_launch_profile|launcher_settings_persistence|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|cache_upgrade_compatibility|cache_native_read|pipeline_build_attempts|pipeline_capture_contract|precompile_schedule|static_input_producer|compile_thread_power|pipeline_late_build|vulkan_recording)$'
 
       - name: Install
         shell: bash

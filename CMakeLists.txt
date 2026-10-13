@@ -173,7 +173,11 @@ list(REMOVE_DUPLICATES KYTY_STATIC_PRODUCER_INPUTS)
 list(SORT KYTY_STATIC_PRODUCER_INPUTS)
 set(KYTY_STATIC_PRODUCER_CONTENTS "static-input-producer-v1\n")
 foreach(KYTY_STATIC_INPUT IN LISTS KYTY_STATIC_PRODUCER_INPUTS)
-    file(SHA256 "${KYTY_STATIC_INPUT}" KYTY_STATIC_INPUT_HASH)
+    # Git checkout policy can leave identical source as LF or CRLF, including
+    # existing checkouts. Keep the canonical LF identity without retagging data.
+    file(READ "${KYTY_STATIC_INPUT}" KYTY_STATIC_INPUT_CONTENTS)
+    string(REPLACE "\r\n" "\n" KYTY_STATIC_INPUT_CONTENTS "${KYTY_STATIC_INPUT_CONTENTS}")
+    string(SHA256 KYTY_STATIC_INPUT_HASH "${KYTY_STATIC_INPUT_CONTENTS}")
     file(RELATIVE_PATH KYTY_STATIC_INPUT_NAME "${KYTY_SOURCE_DIR}" "${KYTY_STATIC_INPUT}")
     string(APPEND KYTY_STATIC_PRODUCER_CONTENTS "${KYTY_STATIC_INPUT_NAME}:${KYTY_STATIC_INPUT_HASH}\n")
 endforeach()
@@ -792,6 +796,14 @@ endif()
 
 if(BUILD_TESTING)
 	find_package(Threads REQUIRED)
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	find_package(Git REQUIRED)
+	add_test(NAME static_input_producer
+		COMMAND "${Python3_EXECUTABLE}" "${KYTY_TESTS_DIR}/StaticInputProducerTests.py"
+			--source "${CMAKE_CURRENT_SOURCE_DIR}"
+			--scratch-root "${CMAKE_CURRENT_BINARY_DIR}/static-producer-tests"
+			--cmake "${CMAKE_COMMAND}" --git "${GIT_EXECUTABLE}")
+	set_tests_properties(static_input_producer PROPERTIES TIMEOUT 120)
 	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
