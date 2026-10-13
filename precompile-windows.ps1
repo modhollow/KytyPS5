@@ -5,7 +5,8 @@
 #                                         a driver that has VK_KHR_pipeline_binary (NVIDIA 5xx) the pipelines'
 #                                         binaries instead, <title>_<version>.binaries, read only when a pipeline is
 #                                         needed (the driver copies a whole .bin into memory: GBs)
-#   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
+#   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 2 threads each, as many as the allowed
+#                                         cores less one hold with their SMT siblings)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -39,7 +40,7 @@ param(
 	# else the release's hints completed with the seed file's code (hinted-<title>_<version>.seeds).
 	[string]$Recorded = '*',
 	[int]$Jobs = 0,
-	[int]$Threads = 3,
+	[int]$Threads = 2,
 	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
@@ -54,6 +55,7 @@ param(
 	[switch]$PlanOnly,
 	[int]$LogicalCpus = 0,
 	[int]$PhysicalCores = 0,
+	[int]$MemoryGB = 0,
 	# Only the first N shards of the seeds, and no merge after them (measuring the precompile: the static cache stays
 	# incomplete); 0: all.
 	[int]$ShardLimit = 0,
@@ -71,29 +73,42 @@ if ($Affinity -eq 0) {
 	foreach ($cpu in (Get-Content $config -Raw | ConvertFrom-Json).cpu_affinity) { $Affinity = $Affinity -bor ([int64]1 -shl [int]$cpu) }
 }
 if ($LogicalCpus -le 0) { $LogicalCpus = [Environment]::ProcessorCount }
-if ($PhysicalCores -le 0) { $PhysicalCores = [math]::Max(1, [int](Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum) }
+if ($PhysicalCores -le 0) {
+	$PhysicalCores = try { [math]::Max(1, [int](Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum) } catch { $LogicalCpus }
+}
 $all = if ($LogicalCpus -ge 64) { [int64]-1 } else { ([int64]1 -shl $LogicalCpus) - 1 }
 $mask = $Affinity -band $all
 if ($mask -eq 0) { $mask = $all }
 $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
 # The processes (Jobs), threads each and power of the shards, and the threads of the single-process steps (Budget).
-# A process scales to a few threads (4: 85%), and each translates the programs its share needs. By default the
-# allowed CPUs' share of the cores less one: an SMT sibling adds little compile throughput and the most heat,
-# and one core stays free for the rest of the PC. EcoQoS is opt-in because precompilation blocks game launch.
-# -FullSpeed: every allowed CPU, with EcoQoS disabled.
-function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$threads, [int]$jobs, [bool]$fullSpeed, [bool]$ecoQoS) {
+# By default the budget is the allowed CPUs' share of the cores less one, so one core stays free for the rest of
+# the PC. The shards' threads fill the budget's cores with their SMT siblings: a process compiles a big compute
+# pipeline nearly alone (the driver) while its other threads wait, so the CPU stays far below its threads (8 cores,
+# 16 threads: 2 processes of 3 threads kept 40 % of it busy; 7 of 2 about 80 %, in about half the time). A process
+# takes up to about 1 GB of memory: at most one per 1.5 GB. EcoQoS is opt-in because precompilation blocks game
+# launch. -FullSpeed: every allowed CPU, with EcoQoS disabled.
+function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$threads, [int]$jobs, [bool]$fullSpeed, [bool]$ecoQoS,
+	[int]$memoryGB) {
+	$memoryJobs = [math]::Max(1, [math]::Floor($memoryGB / 1.5))
 	if ($fullSpeed) {
-		if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Ceiling($cpus / $threads)) }
+		if ($jobs -le 0) { $jobs = [math]::Min($memoryJobs, [math]::Max(1, [math]::Ceiling($cpus / $threads))) }
 		return [pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$cpus; Efficient = $false }
 	}
 	$cores = [math]::Floor($cpus * [math]::Min($physical, $logical) / $logical)
 	$budget = [math]::Max(1, $cores - 1)
-	$threads = [math]::Min($threads, $budget)
-	if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Floor($budget / $threads)) }
+	# The budget's threads: its cores with their SMT siblings.
+	$budgetThreads = [math]::Max(1, [math]::Floor($budget * $logical / [math]::Min($physical, $logical)))
+	$threads = [math]::Min($threads, $budgetThreads)
+	if ($jobs -le 0) { $jobs = [math]::Min($memoryJobs, [math]::Max(1, [math]::Floor($budgetThreads / $threads))) }
 	[pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$budget; Efficient = $ecoQoS }
 }
-$plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent $EcoQoS.IsPresent
+if ($MemoryGB -le 0) {
+	# Without the size (WMI unavailable) the memory does not limit the processes.
+	$MemoryGB = try { [int]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB) } catch { 0 }
+	if ($MemoryGB -le 0) { $MemoryGB = 1024 }
+}
+$plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent $EcoQoS.IsPresent $MemoryGB
 if ($PlanOnly) {
 	[pscustomobject]@{ Cpus = $cpus; Jobs = $plan.Jobs; Threads = $plan.Threads; Budget = $plan.Budget; Efficient = $plan.Efficient } |
 		ConvertTo-Json -Compress
