@@ -1,6 +1,11 @@
 
 find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
 
+add_executable(launcher_launch_profile_tests EXCLUDE_FROM_ALL
+	"${PROJECT_SOURCE_DIR}/tests/LauncherLaunchProfileTests.cpp")
+target_link_libraries(launcher_launch_profile_tests PRIVATE Qt6::Core)
+target_include_directories(launcher_launch_profile_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME launcher_launch_profile COMMAND launcher_launch_profile_tests)
 add_executable(launcher_settings_persistence_tests EXCLUDE_FROM_ALL
 	"${PROJECT_SOURCE_DIR}/tests/LauncherSettingsPersistenceTests.cpp")
 target_link_libraries(launcher_settings_persistence_tests PRIVATE Qt6::Core)
