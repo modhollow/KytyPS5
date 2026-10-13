@@ -661,7 +661,7 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		});
 	}
 	if (create_pipelines) {
-		parallel(seed_words.size() + recipes.size(), [&](size_t n) {
+		const auto pipeline_job = [&](size_t n) {
 			// Once binaries are left out, the rest would be too: for a smaller shard.
 			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0)) return;
 			if (n < seed_words.size()) {
@@ -782,7 +782,25 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 					}
 				}
 			}
-		});
+		};
+		PrecompileSchedule::ForEachPipelineRange(
+		    seed_words.size(), recipes.size(), binaries, [&](size_t begin, size_t count) {
+			    if (count == 0) return;
+			    const auto phase_start   = std::chrono::steady_clock::now();
+			    const auto phase_created = created.load(std::memory_order_relaxed);
+			    parallel(count, [&](size_t i) { pipeline_job(begin + i); });
+			    if (binaries) {
+				    PipelineCacheLog("Shader seeds: {} phase created {} pipelines in {} ms ({} "
+				                     "captured, {} left out)",
+				                     begin == 0 && count == seed_words.size() ? "compute"
+				                                                              : "graphics",
+				                     created.load(std::memory_order_relaxed) - phase_created,
+				                     std::chrono::duration_cast<std::chrono::milliseconds>(
+				                         std::chrono::steady_clock::now() - phase_start)
+				                         .count(),
+				                     writer->Captured(), writer->LeftOut());
+			    }
+		    });
 	}
 
 	{

@@ -33,6 +33,9 @@
 #include "slow-log.h"
 #include "startup-progress.h"
 #include "staticInputProducer.h"
+#ifdef KYTY_STATIC_PRECOMPILE
+#include "graphics/host_gpu/renderer/pipeline/precompileSchedule.h"
+#endif
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif

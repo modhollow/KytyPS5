@@ -157,6 +157,7 @@ file(GLOB_RECURSE KYTY_STATIC_RECOMPILER_INPUTS CONFIGURE_DEPENDS
     "${KYTY_SOURCE_DIR}/graphics/shader/*.inc")
 set(KYTY_STATIC_PRODUCER_INPUTS
     "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/staticPrecompile.inc"
+    "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/precompileSchedule.h"
     "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.h"
     "${KYTY_SOURCE_DIR}/graphics/presentation/window/vulkanWindow.cpp"
     "${KYTY_SOURCE_DIR}/graphics/shader/shaderCompiler.h"
@@ -601,6 +602,10 @@ else()
     target_link_options(static_cache_readiness_tests PRIVATE -Wl,--gc-sections)
 endif()
 
+add_executable(precompile_schedule_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/PrecompileScheduleTests.cpp")
+target_include_directories(precompile_schedule_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(pipeline_capture_contract_tests EXCLUDE_FROM_ALL
     "${KYTY_TESTS_DIR}/PipelineCaptureContractTests.cpp")
 target_link_libraries(pipeline_capture_contract_tests PRIVATE Vulkan::Headers)
@@ -803,6 +808,8 @@ if(BUILD_TESTING)
 	add_test(NAME cache_upgrade_compatibility COMMAND $<TARGET_FILE:pipeline_cache_upgrade_tests>)
 	add_test(NAME cache_native_read COMMAND $<TARGET_FILE:pipeline_cache_native_read_tests>)
 	add_test(NAME static_cache_readiness COMMAND $<TARGET_FILE:static_cache_readiness_tests>)
+	add_test(NAME precompile_schedule COMMAND $<TARGET_FILE:precompile_schedule_tests>)
+	set_tests_properties(precompile_schedule PROPERTIES TIMEOUT 15)
 	add_test(NAME pipeline_capture_contract COMMAND $<TARGET_FILE:pipeline_capture_contract_tests>)
 	add_test(NAME pipeline_build_attempts COMMAND $<TARGET_FILE:pipeline_build_attempt_tests>)
 	set_tests_properties(pipeline_build_attempts PROPERTIES TIMEOUT 15)
@@ -916,6 +923,7 @@ if(BUILD_TESTING)
 		pipeline_cache_native_read_tests
 		static_cache_readiness_tests
 		pipeline_build_attempt_tests
+		precompile_schedule_tests
 		compile_thread_power_tests
 		pipeline_late_build_tests
 		ime_dialog_tests
