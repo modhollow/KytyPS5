@@ -89,6 +89,7 @@ private:
 	QStringList                   m_game_dirs;
 	Configuration                 m_global_info;
 	QMap<QString, Configuration*> m_custom_infos;
+	QMap<QString, QString>        m_settings_identity_aliases;
 	CompatibilityDatabase*        m_compatibility = nullptr;
 };
 

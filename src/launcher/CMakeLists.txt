@@ -1,6 +1,12 @@
 
 find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
 
+add_executable(launcher_settings_persistence_tests EXCLUDE_FROM_ALL
+	"${PROJECT_SOURCE_DIR}/tests/LauncherSettingsPersistenceTests.cpp")
+target_link_libraries(launcher_settings_persistence_tests PRIVATE Qt6::Core)
+target_include_directories(launcher_settings_persistence_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME launcher_settings_persistence COMMAND launcher_settings_persistence_tests)
+
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 

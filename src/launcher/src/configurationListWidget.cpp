@@ -5,6 +5,7 @@
 #include "configuration.h"
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
+#include "configurationPersistence.h"
 #include "gameListTreeWidget.h"
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
@@ -306,19 +307,8 @@ void ConfigurationListWidget::WriteSettings() {
 	s->remove(CONF_GAME_DIR);
 	s->endGroup();
 
-	s->remove(CONF_GLOBAL);
-	s->beginGroup(CONF_GLOBAL);
-	m_global_info.WriteSettings(s.get());
-	s->endGroup();
-
-	s->remove(CONF_SECTION_NAME);
-	s->beginWriteArray(CONF_SECTION_NAME);
-	int i = 0;
-	for (auto it = m_custom_infos.constBegin(); it != m_custom_infos.constEnd(); ++it) {
-		s->setArrayIndex(i++);
-		it.value()->WriteSettings(s.get());
-	}
-	s->endArray();
+	LauncherSettings::WriteConfigurations(*s, CONF_GLOBAL, CONF_SECTION_NAME, m_global_info,
+	                                      m_custom_infos, m_settings_identity_aliases);
 }
 
 void ConfigurationListWidget::ReadSettings() {
@@ -356,6 +346,7 @@ void ConfigurationListWidget::ReadSettings() {
 
 	qDeleteAll(m_custom_infos);
 	m_custom_infos.clear();
+	m_settings_identity_aliases.clear();
 
 	int size = s->beginReadArray(CONF_SECTION_NAME);
 
@@ -522,23 +513,10 @@ static void SetGameFiles(Configuration& info, const QString& game_dir, const QSt
 }
 
 static Configuration* FindCustomInfo(QMap<QString, Configuration*>* custom_infos,
-                                     const QString& game_path, const QString& legacy_game_path) {
-	auto custom = custom_infos->find(game_path);
-	if (custom != custom_infos->end()) {
-		return custom.value();
-	}
-
-	custom = custom_infos->find(legacy_game_path);
-	if (custom == custom_infos->end()) {
-		return nullptr;
-	}
-
-	auto* info = custom.value();
-	custom_infos->erase(custom);
-	info->game_path = game_path;
-	custom_infos->insert(game_path, info);
-
-	return info;
+                                     const QString& game_path, const QString& legacy_game_path,
+                                     QMap<QString, QString>& identity_aliases) {
+	return LauncherSettings::FindCustomInfo(*custom_infos, game_path, legacy_game_path,
+	                                        identity_aliases);
 }
 
 bool ConfigurationListWidget::EnsureGameDirectory() {
@@ -602,7 +580,8 @@ void ConfigurationListWidget::ScanGameDirectory() {
 				    game_dir.filePath(QStringLiteral("sce_sys/param.json")), game_dir.dirName());
 
 				auto  info   = std::make_unique<Configuration>();
-				auto* custom = FindCustomInfo(&m_custom_infos, game_path, legacy_game_path);
+				auto* custom = FindCustomInfo(&m_custom_infos, game_path, legacy_game_path,
+				                              m_settings_identity_aliases);
 				if (custom != nullptr) {
 					info->CopyFrom(*custom);
 					info->custom_settings = true;
