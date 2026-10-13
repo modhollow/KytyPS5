@@ -51,6 +51,9 @@ param(
 	[int]$FrameGen = 0,
 	[string]$Affinity = '',
 	[switch]$Prompt,
+	# A partial precompile (-RecordedOnly, -Minutes) goes on in the background while the game runs: one idle process
+	# (precompile-windows.ps1 -Background); what it finishes is merged before the next start.
+	[switch]$BackgroundPrecompile,
 	[switch]$Follow,
 	[switch]$DryRun,
     [string]$CacheRoot = ''
@@ -485,7 +488,8 @@ if ($Prompt -and ($offer -or !$tested)) {
 		if ($choice -ne 0 -and $choice -ne 1) { Write-Host 'cancelled'; return }
 		if ($choice -eq 0) {
 			try {
-				& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask
+				# The launch's precompile program, seed file and caches (the finished-shards list is keyed to them).
+				& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask -Exe $tool -Seeds $seeds -CacheRoot $CacheRoot
 				$inputsReady = $true # the full run ends with them
 			} catch {
 				Write-Host "precompile failed ($($_.Exception.Message)); starting the game anyway"
@@ -527,6 +531,25 @@ if ($memory -and $Prompt) {
 	if ($choice -ne 0) { Write-Host 'cancelled'; return }
 }
 
+# Shards a background or interrupted precompile finished: into the store before the game opens it (and, when
+# they are all there, the precompile is complete).
+# (This game's; small ones stay behind after a merge.)
+$waiting = $shaders -and $param -and (Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\$($titleId)_$($param.contentVersion).*.shard*" -ErrorAction SilentlyContinue |
+	Where-Object { $_.Length -gt 1MB -and $_.Name -notmatch '\.tmp(?:\.|$)' })
+if ($waiting -and !$DryRun) {
+	Write-Host 'shaders:  merging the shards an earlier precompile finished'
+	try {
+		& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask -Exe $tool -Seeds $seeds -CacheRoot $CacheRoot -MergeOnly
+		# Complete when the merge finished the precompile: no partial mark and no finished-shards list (a complete
+		# run removes both; an interrupted full run keeps its list), and then it made the inputs too.
+		$cacheStem = "$CacheRoot\static-v1\$($titleId)_$($param.contentVersion)"
+		$cachePartial = Test-Path "$cacheStem.partial"
+		$inputsReady = $inputsReady -or (!$cachePartial -and !(Test-Path "$cacheStem.done"))
+	} catch {
+		Write-Host "shaders:  merging failed ($($_.Exception.Message)); they are merged by the next precompile"
+	}
+}
+
 if ($shaders -and !$inputsReady) {
 	Write-Host 'shaders:  making the background shader preparation inputs for this graphics card (first run or after a driver update: about a minute)'
 	if ((Invoke-Tool @('--no-pipelines', '--static-inputs', '--threads', "$cpus")) -ne 0) {
@@ -542,6 +565,24 @@ $process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory 
 if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
 $null = $process.Handle # keeps the exit code readable after the process ends
 Write-Host "pid $($process.Id); logs: $($logDir.Substring($PSScriptRoot.Length + 1))\$stamp.*.log"
+# The background run takes up to about 1.5 GB more on top of the game's 34 GB.
+if ($BackgroundPrecompile -and $shaders -and $cachePartial -and $commit -lt 36GB) {
+	Write-Host 'shaders:  no background precompile: Windows has too little memory left for it next to the game'
+} elseif ($BackgroundPrecompile -and $shaders -and $cachePartial) {
+	# Without the game's switches (as the precompile before the game runs: the finished-shards list is keyed to them).
+	$saved = @{}
+	foreach ($key in @($environment.Keys)) { $saved[$key] = [Environment]::GetEnvironmentVariable($key); Remove-Item "env:$key" -ErrorAction SilentlyContinue }
+	try {
+		$shell = (Get-Process -Id $PID).Path
+		$background = Start-Process -FilePath $shell -WindowStyle Hidden -PassThru -RedirectStandardOutput "$logDir\$stamp.precompile.log" `
+			-RedirectStandardError "$logDir\$stamp.precompile.err.log" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+			"`"$PSScriptRoot\precompile-windows.ps1`"", '-Game', "`"$Game`"", '-Affinity', "$mask", '-Exe', "`"$tool`"", '-Seeds', "`"$seeds`"",
+			'-CacheRoot', "`"$CacheRoot`"", '-Background', '-WhileProcess', "$($process.Id)")
+		Write-Host "shaders:  precompiling the rest in the background (pid $($background.Id); log $stamp.precompile.log)"
+	} finally {
+		foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
+	}
+}
 if (!$Precompile -and $Follow) {
 	# The run log in this window as it is written; the exit code (and the error log's end) when the game ends.
 	$reader = $null

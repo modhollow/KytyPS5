@@ -14,6 +14,10 @@
 #   .\precompile-windows.ps1 -Minutes 15  a time budget: no shard starts after 15 minutes of compiling (the running
 #                                         ones finish: up to the longest shard over, then the merge), and what is
 #                                         done is kept (recorded play first); run it again to continue where it stopped
+#   .\precompile-windows.ps1 -Background -WhileProcess <pid>  the shards not finished yet, one idle process, while the
+#                                         game (that process) runs; no merge (the game has the store open)
+#   .\precompile-windows.ps1 -MergeOnly   the finished shards into the store, before the game starts; when every
+#                                         shard is finished, the precompile is complete (run-windows.ps1 does both)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -58,6 +62,14 @@ param(
 	# (no pruning; <title>_<version>.partial). A later run continues: the shards finished for the same inputs
 	# (<title>_<version>.done) are not run again.
 	[int]$Minutes = 0,
+	# While the game runs (run-windows.ps1 -BackgroundPrecompile): one process at idle priority with power saving,
+	# no merge; with -WhileProcess it stops when that process exits (the shard in progress is lost, the finished
+	# ones are listed in <title>_<version>.done and merged by the next -MergeOnly or precompile).
+	[switch]$Background,
+	[int]$WhileProcess = 0,
+	# Merge the finished shards and stop; when every shard is finished, also finish the precompile (the partial
+	# mark and the list removed, the prefetch inputs made).
+	[switch]$MergeOnly,
 	# Every allowed CPU (the processes still below normal priority), instead of the cores less one.
 	# Overrides EcoQoS.
 	[switch]$FullSpeed,
@@ -124,6 +136,12 @@ if ($MemoryGB -le 0) {
 	if ($MemoryGB -le 0) { $MemoryGB = 1024 }
 }
 $plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent $EcoQoS.IsPresent $MemoryGB
+# In the background: one process of at most two threads, with power saving, next to the game; this script and
+# the steps it runs itself (the seed and hint files, the store probe) at idle priority too (children inherit it).
+if ($Background) {
+	$plan = [pscustomobject]@{ Jobs = 1; Threads = [math]::Min(2, $plan.Threads); Budget = 1; Efficient = $true }
+	try { (Get-Process -Id $PID).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Idle } catch {}
+}
 if ($PlanOnly) {
 	[pscustomobject]@{ Cpus = $cpus; Jobs = $plan.Jobs; Threads = $plan.Threads; Budget = $plan.Budget; Efficient = $plan.Efficient } |
 		ConvertTo-Json -Compress
@@ -331,7 +349,7 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
-	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+	$process.PriorityClass = if ($Background) { [System.Diagnostics.ProcessPriorityClass]::Idle } else { [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
 	if ($plan.Efficient -and ![Kyty.ProcessPower]::Throttle($process.Handle) -and $script:reducedPower -ne 'unavailable') {
 		$script:reducedPower = 'unavailable'
 		Write-Host 'precompile: Windows did not enable EcoQoS; continuing with its default power policy'
@@ -364,8 +382,15 @@ if ($InputsOnly) {
 	Write-Host "inputs saved beneath $CacheRoot (producer and integrity checked on load)"
 	return
 }
-# The shards an interrupted run finished first: what they hold is not compiled again.
-Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
+# The shards an interrupted run finished first: what they hold is not compiled again. Not in the background:
+# the game has the store open.
+if (!$Background) {
+	# A shard ended while saving (a background run when the game closed) leaves a temporary file no merge reads.
+	Remove-Item "$CacheRoot\static-v1\driver-v1\*\$gameId.*.shard*.tmp.*" -ErrorAction SilentlyContinue
+	Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
+}
+# Whether the game the background run works next to still runs.
+function Test-WatchedProcess { return !$WhileProcess -or [bool](Get-Process -Id $WhileProcess -ErrorAction SilentlyContinue) }
 $pending = [System.Collections.Generic.LinkedList[object]]::new()
 # A shard's name (its logs, its NVIDIA cache, the finished-shards list): contiguous slices (b) and every n-th
 # hold different items under the same i/n.
@@ -401,6 +426,10 @@ foreach ($entry in $queue) {
 	if ($done.Contains((Get-ShardName $entry[0] $entry[1] $entry[2]))) { $skipped++ } else { [void]$pending.AddLast($entry) }
 }
 if ($skipped) { Write-Host "precompile: $skipped shards an earlier run finished are kept, not run again" }
+if ($MergeOnly -and $pending.Count) {
+	Write-Host "precompile: finished shards merged; $($pending.Count) shards are left for a later run"
+	return
+}
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
 $env:KYTY_PRECOMPILE_CLAIMS = Join-Path $nvidiaCaches 'claims'
@@ -411,7 +440,25 @@ $shown = Get-Date
 # The budget counts from the first shard: making seeds and hints and merging an earlier run's shards come first.
 $deadline = if ($Minutes -gt 0) { (Get-Date).AddMinutes($Minutes) } else { [datetime]::MaxValue }
 $budgetStopped = $false
+$gameEnded = $false
 while (($pending.Count -and !$budgetStopped) -or $running.Count) {
+	if (!(Test-WatchedProcess)) {
+		# The game ended: so does the background run (the shard in progress starts again next time).
+		$gameEnded = $true
+		foreach ($name in @($running.Keys)) {
+			$process = $running[$name][2]
+			if (!$process.HasExited) {
+				$process.Kill()
+				$process.WaitForExit()
+			} elseif ($process.ExitCode -eq 0) {
+				# Finished just now: listed like the others.
+				$finished++
+				Add-DoneShard $doneFile $doneInputs $name
+			}
+		}
+		$running.Clear()
+		break
+	}
 	while ($pending.Count -and $running.Count -lt $Jobs -and !$budgetStopped) {
 		if ((Get-Date) -ge $deadline) {
 			$budgetStopped = $true
@@ -459,6 +506,11 @@ while (($pending.Count -and !$budgetStopped) -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
+if ($Background) {
+	Write-Host ("precompile: {0} shards finished in the background in {1:hh\:mm\:ss}, {2} left{3}; merged before the next start" -f
+		$finished, ((Get-Date) - $begin), $pending.Count, $(if ($gameEnded) { ' (the game ended)' } else { '' }))
+	return
+}
 if ($ShardLimit -gt 0) {
 	Write-Host ("{0} of {1} shards done in {2:hh\:mm\:ss} ({3} split); not merged (-ShardLimit)" -f $finished, $Shards, ((Get-Date) - $begin), $split)
 	return

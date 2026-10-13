@@ -30,6 +30,11 @@ function Get-ShardInputs { return 'fixture-inputs' }
 function Read-DoneShards { return , $script:fixture.Done }
 function Add-DoneShard([string]$file, [string]$inputs, [string]$name) { $script:fixture.Recorded.Add($name) }
 function Remove-NvidiaCache { param($process) }
+# -Background, -MergeOnly and the game the background run watches (it ends after GameEndsAfter launches).
+$caseOptions = @{}
+function Test-WatchedProcess {
+    return !($script:caseOptions.GameEndsAfter -and $script:fixture.Starts -ge $script:caseOptions.GameEndsAfter)
+}
 
 function Start-Precompile([string]$name, [string[]]$arguments) {
     ++$script:fixture.Starts
@@ -62,8 +67,10 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
         foreach ($item in $items) { $script:fixture.Completed.Add([int]$item) }
     }
     # A worker runs for -Lag polls of the scheduler before it has exited.
-    $worker = [pscustomobject]@{ ExitCode = $exit; Polls = 0; Lag = $script:fixture.Lag }
-    $worker | Add-Member ScriptProperty HasExited { $this.Polls++; $this.Polls -gt $this.Lag }
+    $worker = [pscustomobject]@{ ExitCode = $exit; Polls = 0; Lag = $script:fixture.Lag; Killed = $false }
+    $worker | Add-Member ScriptProperty HasExited { $this.Polls++; $this.Killed -or $this.Polls -gt $this.Lag }
+    $worker | Add-Member ScriptMethod Kill { $this.Killed = $true; $script:fixture.Kills++ }
+    $worker | Add-Member ScriptMethod WaitForExit { }
     return $worker
 }
 
@@ -79,7 +86,10 @@ function Invoke-SchedulerCase([string]$kind, [int]$shards, [int]$jobs,
         Launched = [Collections.Generic.List[object]]::new()
         Blocks = [Collections.Generic.List[object]]::new()
         Completed = [Collections.Generic.List[int]]::new()
+        Kills = 0
     }
+    $Background = [bool]$script:caseOptions.Background
+    $MergeOnly = [bool]$script:caseOptions.MergeOnly
     $Seeds = 'fixture.seeds'
     $Recorded = $recorded
     $RecordedOnly = $recordedOnly
@@ -102,6 +112,7 @@ function Invoke-SchedulerCase([string]$kind, [int]$shards, [int]$jobs,
     return [pscustomobject]@{
         Error = $errorText; Finished = $finished; Split = $split; Merge = ($mergeArguments -join ' ')
         BudgetStopped = $budgetStopped; Partial = $partialRun; Skipped = $skipped
+        Kills = $script:fixture.Kills; GameEnded = $gameEnded
         DoneAdded = @($script:fixture.Recorded.ToArray())
         Starts = $script:fixture.Starts; PeakPending = $script:fixture.PeakPending
         Completed = @($script:fixture.Completed.ToArray())
@@ -234,6 +245,31 @@ try {
         "A finished half ran again: $($names -join ', ') (skipped $($r.Skipped)) $($r.Error)")
     Check ((($r.Completed | Sort-Object) -join ',') -eq ((0..31 | Where-Object { $_ % 8 -ne 0 }) -join ',')) (
         'The other halves lost or duplicated work')
+
+    # -MergeOnly: finished shards merged (merge-before), nothing compiled while shards are left; when every
+    # shard is finished, the precompile completes (merged without pruning, not partial).
+    $caseOptions = @{ MergeOnly = $true }
+    $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 '' $false 0 0 0 @('shard0of4-fixture')
+    Check (!$r.Error -and $r.Starts -eq 0 -and !$r.Merge) "-MergeOnly compiled or completed with shards left: starts $($r.Starts), merge '$($r.Merge)'"
+    $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 '' $false 0 0 0 @('shard0of4-fixture', 'shard1of4-fixture', 'shard2of4-fixture', 'shard3of4-fixture')
+    Check (!$r.Error -and $r.Starts -eq 0 -and $r.Merge -eq '--merge' -and !$r.Partial) (
+        "-MergeOnly did not complete a finished precompile: merge '$($r.Merge)', partial $($r.Partial) $($r.Error)")
+
+    # -Background: the shards not finished yet, no merge; it stops when the game ends, ending the shard in progress.
+    $caseOptions = @{ Background = $true }
+    $r = Invoke-SchedulerCase 'success' 4 1 @(0..7) 20 '' $false 0 0 0 @('shard0of4-fixture')
+    Check (!$r.Error -and $r.Starts -eq 3 -and $r.Finished -eq 3 -and !$r.Merge -and $r.DoneAdded.Count -eq 3) (
+        "-Background did not run the unfinished shards without a merge: starts $($r.Starts), merge '$($r.Merge)' $($r.Error)")
+    $caseOptions = @{ Background = $true; GameEndsAfter = 2 }
+    $r = Invoke-SchedulerCase 'success' 4 1 @(0..7) 20 '' $false 0 0 3
+    Check (!$r.Error -and $r.GameEnded -and $r.Starts -eq 2 -and $r.Kills -eq 1 -and $r.Finished -eq 1 -and !$r.Merge) (
+        "-Background did not stop with the game: starts $($r.Starts), kills $($r.Kills), finished $($r.Finished) $($r.Error)")
+    # A shard that finished as the game ended is listed, not compiled again.
+    $caseOptions = @{ Background = $true; GameEndsAfter = 2 }
+    $r = Invoke-SchedulerCase 'success' 4 2 @(0..7) 20 '' $false 0 0 1
+    Check (!$r.Error -and $r.GameEnded -and $r.Kills -eq 0 -and $r.Finished -eq 2 -and $r.DoneAdded.Count -eq 2) (
+        "Shards finished as the game ended were not listed: finished $($r.Finished), listed $($r.DoneAdded.Count), kills $($r.Kills)")
+    $caseOptions = @{}
 
     $r = Invoke-SchedulerCase 'fatal' 8 5 @(0..7) 12
     Check ($r.Error -match 'failed; logs: fixture-logs') (
