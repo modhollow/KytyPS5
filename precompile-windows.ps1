@@ -11,6 +11,9 @@
 #                                         release's hints): about a fifth of the time; the rest is compiled when the
 #                                         game first needs it, or by a full run later (which keeps these);
 #                                         run-windows.ps1 -Prompt still offers that full run (<title>_<version>.partial)
+#   .\precompile-windows.ps1 -Minutes 15  a time budget: no shard starts after 15 minutes of compiling (the running
+#                                         ones finish: up to the longest shard over, then the merge), and what is
+#                                         done is kept (recorded play first); run it again to continue where it stopped
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -50,6 +53,11 @@ param(
 	[switch]$Coverage,
 	[switch]$InputsOnly,
 	[switch]$RecordedOnly,
+	# A time budget in minutes of compiling (0: none; making seeds and hints and merging earlier shards come first
+	# and are not counted): no shard starts after it, the running ones finish, and the cache is merged as partial
+	# (no pruning; <title>_<version>.partial). A later run continues: the shards finished for the same inputs
+	# (<title>_<version>.done) are not run again.
+	[int]$Minutes = 0,
 	# Every allowed CPU (the processes still below normal priority), instead of the cores less one.
 	# Overrides EcoQoS.
 	[switch]$FullSpeed,
@@ -68,6 +76,8 @@ param(
 	[string]$Exe = $(if (Test-Path "$PSScriptRoot\kyty_shader_precompile.exe") { "$PSScriptRoot\kyty_shader_precompile.exe" } else { "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe" })
 )
 $ErrorActionPreference = 'Stop'
+# Where the precompiler runs (as the emulator does: it reads the launch configuration there).
+$toolDirectory = $PSScriptRoot
 if (!$CacheRoot) { $CacheRoot = if ($env:KYTY_PIPELINE_CACHE_ROOT) { $env:KYTY_PIPELINE_CACHE_ROOT } else { Join-Path $PSScriptRoot '_PipelineCache' } }
 $CacheRoot = [IO.Path]::GetFullPath($CacheRoot)
 $env:KYTY_PIPELINE_CACHE_ROOT = $CacheRoot
@@ -226,6 +236,56 @@ if ($Recorded -eq '*') {
 		}
 	}
 }
+# The shards an earlier run finished (<title>_<version>.done: the inputs they were made from, then one shard
+# name a line), when its inputs were this run's: the precompiler and the seed files by content, the switches
+# that change what they compile to, and the display adapters with their drivers (the store is the GPU's and the
+# driver's: static-v1\driver-v1\<device>). And only while this GPU and driver have a store (--status), which
+# holds what those shards made.
+function Get-ShardInputs([string[]]$files) {
+	$hashes = $files | Where-Object { $_ -and (Test-Path $_) } | ForEach-Object { (Get-FileHash $_).Hash }
+	# The PCI display adapters (not the remote, virtual or capture ones that come and go with a session).
+	$adapters = try {
+		Get-CimInstance Win32_VideoController | Where-Object { "$($_.PNPDeviceID)" -like 'PCI\*' } | Sort-Object PNPDeviceID |
+			ForEach-Object { "$($_.PNPDeviceID)=$($_.DriverVersion)" }
+	} catch { 'adapters unknown' }
+	$switches = "KYTY_PORTABLE_SHADERS=$env:KYTY_PORTABLE_SHADERS KYTY_ROBUST_BUFFERS=$env:KYTY_ROBUST_BUFFERS"
+	((@($hashes) + @($adapters) + $switches) -join ' ')
+}
+# Whether this GPU and driver have a store (precompiler --status): 'yes', 'no' (stale), or 'unknown' when the
+# probe itself failed (no device, a crash), which must not discard the list.
+function Get-StoreOfThisDevice {
+	$out = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-status-$PID"
+	try {
+		$probe = Start-Process -FilePath $Exe -ArgumentList @('--game', "`"$Game`"", '--seeds', "`"$Seeds`"", '--status') `
+			-WorkingDirectory $toolDirectory -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$out.out" -RedirectStandardError "$out.err"
+		$status = @(Get-Content "$out.out" -ErrorAction SilentlyContinue)
+		if ($probe.ExitCode -ne 0 -or !($status -match '^static cache ')) { return 'unknown' }
+		if ($status -match '^static cache (current|outdated)') { 'yes' } else { 'no' }
+	} catch {
+		'unknown'
+	} finally {
+		Remove-Item "$out.out", "$out.err" -ErrorAction SilentlyContinue
+	}
+}
+function Read-DoneShards([string]$file, [string]$inputs) {
+	$set = [Collections.Generic.HashSet[string]]::new()
+	if (Test-Path $file) {
+		$lines = @(Get-Content $file)
+		$store = if ($lines.Count -and $lines[0] -eq $inputs) { Get-StoreOfThisDevice } else { 'no' }
+		if ($store -eq 'yes') {
+			foreach ($line in $lines | Select-Object -Skip 1) { [void]$set.Add($line) }
+		} elseif ($store -eq 'no') {
+			Remove-Item $file
+		} else {
+			Write-Host 'precompile: could not tell whether this GPU has a store; the finished-shards list is kept but not used'
+		}
+	}
+	return , $set
+}
+function Add-DoneShard([string]$file, [string]$inputs, [string]$name) {
+	if (!(Test-Path $file)) { New-Item -ItemType Directory -Force (Split-Path $file) | Out-Null; Set-Content $file $inputs }
+	Add-Content $file $name
+}
 # The pipeline recipes of a seed file (its body after the identity line and checksum: the records, each its word
 # count and words, then the recipes' count).
 function Get-SeedPipelines([string]$file) {
@@ -307,20 +367,32 @@ if ($InputsOnly) {
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
 $pending = [System.Collections.Generic.LinkedList[object]]::new()
+function Get-ShardName([string]$seedFile, [string]$shard) {
+	'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
+}
 # What recorded play uses first (exactly the pipelines the game asks for: a fifth of the work), then every
 # shader of the game as the seeds guess it: a run stopped part way has the ones that matter most.
 $recordedShards = $ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)
+$doneFile = Join-Path $CacheRoot "static-v1\$gameId.done"
+$doneInputs = Get-ShardInputs @($Exe, $Seeds, $(if ($recordedShards) { $Recorded }))
+$done = if ($ShardLimit -le 0) { Read-DoneShards $doneFile $doneInputs } else { [Collections.Generic.HashSet[string]]::new() }
+$skipped = 0
+$queue = @()
 if ($recordedShards) {
 	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
 	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
-	for ($i = 0; $i -lt $count; $i++) { [void]$pending.AddLast(@($Recorded, "$i/$count")) }
+	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Recorded, "$i/$count") }
 } elseif ($RecordedOnly -and $ShardLimit -le 0) {
 	Write-Host 'precompile: no recorded play or hints for this game version: every shader instead (-RecordedOnly ignored)'
 }
 if (!$RecordedOnly -or !$recordedShards) {
 	$count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
-	for ($i = 0; $i -lt $count; $i++) { [void]$pending.AddLast(@($Seeds, "$i/$Shards")) }
+	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Seeds, "$i/$Shards") }
 }
+foreach ($entry in $queue) {
+	if ($done.Contains((Get-ShardName $entry[0] $entry[1]))) { $skipped++ } else { [void]$pending.AddLast($entry) }
+}
+if ($skipped) { Write-Host "precompile: $skipped shards an earlier run finished are kept, not run again" }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
 $env:KYTY_PRECOMPILE_CLAIMS = Join-Path $nvidiaCaches 'claims'
@@ -328,11 +400,20 @@ $running = @{}
 $finished = 0
 $split = 0
 $shown = Get-Date
-while ($pending.Count -or $running.Count) {
-	while ($pending.Count -and $running.Count -lt $Jobs) {
+# The budget counts from the first shard: making seeds and hints and merging an earlier run's shards come first.
+$deadline = if ($Minutes -gt 0) { (Get-Date).AddMinutes($Minutes) } else { [datetime]::MaxValue }
+$budgetStopped = $false
+while (($pending.Count -and !$budgetStopped) -or $running.Count) {
+	while ($pending.Count -and $running.Count -lt $Jobs -and !$budgetStopped) {
+		if ((Get-Date) -ge $deadline) {
+			$budgetStopped = $true
+			Write-Host ("precompile: the {0}-minute budget is used; {1} running shards finish, {2} wait for a later run" -f $Minutes,
+				$running.Count, $pending.Count)
+			break
+		}
 		$seedFile, $shard = $pending.First.Value
 		$pending.RemoveFirst()
-		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
+		$name = Get-ShardName $seedFile $shard
 		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")))
 	}
 	Start-Sleep -Milliseconds 250
@@ -347,13 +428,16 @@ while ($pending.Count -or $running.Count) {
 			# Resolve smaller retries before expanding all remaining parents. A FIFO
 			# frontier can grow for hours without reaching a completed or terminal child.
 			# Both modulo halves remain scheduled; partial shard data stays available.
-			[void]$pending.AddFirst(@($seedFile, "$($i + $n)/$(2 * $n)"))
-			[void]$pending.AddFirst(@($seedFile, "$i/$(2 * $n)"))
+			# Halves an earlier run finished are kept (a shard that splits splits again).
+			foreach ($half in "$($i + $n)/$(2 * $n)", "$i/$(2 * $n)") {
+				if ($done.Contains((Get-ShardName $seedFile $half))) { $skipped++ } else { [void]$pending.AddFirst(@($seedFile, $half)) }
+			}
 			$split++
 		} elseif ($process.ExitCode -ne 0) {
 			throw "$name failed; logs: $logName"
 		} else {
 			$finished++
+			if ($ShardLimit -le 0) { Add-DoneShard $doneFile $doneInputs $name }
 		}
 	}
 	if (((Get-Date) - $shown).TotalSeconds -ge 60) {
@@ -367,17 +451,23 @@ if ($ShardLimit -gt 0) {
 	Write-Host ("{0} of {1} shards done in {2:hh\:mm\:ss} ({3} split); not merged (-ShardLimit)" -f $finished, $Shards, ((Get-Date) - $begin), $split)
 	return
 }
-# -RecordedOnly keeps what an earlier full run made (--prune would keep only this run's), and marks the
-# cache as partial: the store is newer than the seeds, so --status calls it current, and run-windows.ps1
-# -Prompt would stop offering the full run. A full run removes the mark.
-$mergeArguments = if ($RecordedOnly -and $recordedShards) { @('--merge') } else { @('--merge', '--prune') }
+# -RecordedOnly and a used -Minutes budget keep what an earlier run made (--prune would keep only this run's),
+# and mark the cache as partial: the store is newer than the seeds, so --status calls it current, and
+# run-windows.ps1 -Prompt would stop offering the full run. A full run removes the mark. A run that kept
+# shards an earlier one finished does not prune either: their pipelines are in no shard file of this run (so
+# pipelines that no seed makes any more stay until a full run that starts from no finished shards).
+$partialRun = ($RecordedOnly -and $recordedShards) -or $budgetStopped
+$mergeArguments = if ($partialRun -or $skipped) { @('--merge') } else { @('--merge', '--prune') }
 $partial = Join-Path $CacheRoot "static-v1\$gameId.partial"
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
-if ($RecordedOnly -and $recordedShards) {
+if ($partialRun) {
 	New-Item -ItemType Directory -Force (Split-Path $partial) | Out-Null
-	Set-Content $partial 'precompile-windows.ps1 -RecordedOnly: only what recorded play uses (a full run removes this)'
+	$why = @()
+	if ($RecordedOnly -and $recordedShards) { $why += 'only what recorded play uses (-RecordedOnly)' }
+	if ($budgetStopped) { $why += "the $Minutes-minute budget ended the run (-Minutes)" }
+	Set-Content $partial "precompile-windows.ps1: $($why -join '; '); a full run removes this"
 } else {
-	Remove-Item $partial -ErrorAction SilentlyContinue
+	Remove-Item $partial, $doneFile -ErrorAction SilentlyContinue
 }
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\$gameId.bin", "$CacheRoot\static-v1\driver-v1\*\$gameId.binaries" -ErrorAction SilentlyContinue |

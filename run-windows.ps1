@@ -453,7 +453,7 @@ if ($shaders) {
 	$cachePartial = $param -and (Test-Path "$CacheRoot\static-v1\$($titleId)_$($param.contentVersion).partial")
 	$cacheReady = !$cachePartial -and $status -match 'static cache current' -and
 		!(Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\*.shard*" -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 1MB -and $_.Name -notmatch '\.tmp(?:\.|$)' })
-	Write-Host "shaders:  prefetch inputs (producer/integrity checked) $(if ($inputsReady) { 'ready' } else { 'to be made' }), static pipeline cache $(if ($cacheReady) { 'ready' } elseif ($cachePartial) { 'what recorded play uses (precompile-windows.ps1 compiles the rest)' } elseif ($cacheOutdated) { 'out of date (precompile-windows.ps1 compiles what is new)' } else { 'not made (precompile-windows.ps1)' })"
+	Write-Host "shaders:  prefetch inputs (producer/integrity checked) $(if ($inputsReady) { 'ready' } else { 'to be made' }), static pipeline cache $(if ($cacheReady) { 'ready' } elseif ($cachePartial) { 'partial (precompile-windows.ps1 compiles the rest)' } elseif ($cacheOutdated) { 'out of date (precompile-windows.ps1 compiles what is new)' } else { 'not made (precompile-windows.ps1)' })"
 }
 
 # -Prompt: the game version and the precompile, before anything starts.
@@ -470,7 +470,7 @@ if ($Prompt -and ($offer -or !$tested)) {
 		if ($plan -and $plan.Efficient) { $load += ', with power saving enabled' }
 		$time = 'may take hours, depending on the hardware, driver and shaders'
 		$message = if ($cachePartial) {
-			"$info`n`nOnly the shaders recorded play uses are precompiled for this graphics card: the rest stutter the first time they appear in the game.`n" +
+			"$info`n`nOnly part of the shaders is precompiled for this graphics card (what recorded play uses, or what a time budget allowed): the rest stutter the first time they appear in the game.`n" +
 				"Precompiling the rest $time ($load; closing its window stops it, and the next run continues)."
 		} elseif ($cacheOutdated) {
 			"$info`n`nThis version of the emulator precompiles more of the game's shaders than the one that made the precompiled shaders on this PC: the new ones would stutter the first time they appear.`n" +
