@@ -31,7 +31,8 @@ enum class Caller {
 	NativeWorker,
 	OptimizeWorker,
 	Warmup,
-	Precompile
+	Precompile,
+	LoadWorker // a pipeline recorded draws or dispatches wait for (pipelineLateBuild.h)
 };
 enum class DriverCache { Unknown, Main, Table, Static };
 enum class Mode { Full, Fast, Optimize };

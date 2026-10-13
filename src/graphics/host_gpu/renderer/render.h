@@ -291,7 +291,7 @@ private:
 	                         bool set_bind_debug, bool set_auto_debug);
 	void CommitGraphicsState(CommandBuffer& buffer, const ShaderVertexInputInfo& input,
 	                         const RenderColorInfo* colors, uint32_t color_count,
-	                         const RenderDepthInfo& depth, vk::Pipeline pipeline,
+	                         const RenderDepthInfo& depth, const PipelineCache::Pipeline& pipeline,
 	                         vk::ImageAspectFlags feedback_aspects);
 	[[nodiscard]] RenderState
 	AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors, uint32_t color_count,

@@ -5,6 +5,7 @@
 #include "live-counters.h"
 #include "live-trace-gpu.h"
 #include "local-platform.h"
+#include "slow-log.h"
 #include "time-census.h"
 
 #include <array>
@@ -165,17 +166,26 @@ public:
 };
 
 // A producer waiting for the worker (a full stream, a drain): the slow-frame lines' record_wait
-// (render thread) and the live counter record_wait_us.
+// (render thread) and the live counter record_wait_us. KYTY_HITCH_LOG_MS: a SLOW RecordWait line
+// names what waited (a full queue, or the Vulkan call that drained it).
 struct RecordWait {
 	LiveCensus::WaitScope                       scope {LiveCensus::WaitRecord};
 	const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-	RecordWait()                                      = default;
-	RecordWait(const RecordWait&)                     = delete;
-	RecordWait& operator=(const RecordWait&)          = delete;
+	const char*                                 cause;
+	explicit RecordWait(const char* cause): cause(cause) {}
+	RecordWait(const RecordWait&)            = delete;
+	RecordWait& operator=(const RecordWait&) = delete;
 	~RecordWait() {
-		LiveCounters::Add(
-		    LiveCounters::RecordWaitUs,
-		    static_cast<uint64_t>((std::chrono::steady_clock::now() - start).count()) / 1000u);
+		const auto us =
+		    static_cast<uint64_t>((std::chrono::steady_clock::now() - start).count()) / 1000u;
+		LiveCounters::Add(LiveCounters::RecordWaitUs, us);
+		if (const double threshold = SlowLog::HitchThreshold();
+		    threshold > 0.0 && static_cast<double>(us) / 1000.0 >= threshold) {
+			std::printf("[tsc %llu] SLOW RecordWait %.1f ms %s\n",
+			            static_cast<unsigned long long>(__rdtsc()),
+			            static_cast<double>(us) / 1000.0, cause);
+			std::fflush(stdout);
+		}
 	}
 };
 
@@ -185,7 +195,7 @@ class Stream {
 public:
 	Stream(): worker([this] { Run(); }) {}
 	~Stream() {
-		Drain();
+		Drain("stream end");
 		stopping.store(true, std::memory_order_release);
 		// atomic::wait requires a changed value, not just notify, to terminate.
 		published.fetch_add(1, std::memory_order_release);
@@ -194,8 +204,8 @@ public:
 	}
 	alignas(64) std::atomic<uint64_t> state_epoch {0};
 	alignas(64) bool was_recording = false;
-	void BeforeDirect() {
-		Drain();
+	void BeforeDirect(const char* call) {
+		Drain(call);
 		const bool active = kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
 		if (active || was_recording) state_epoch.fetch_add(1, std::memory_order_relaxed);
 		was_recording = active;
@@ -230,10 +240,10 @@ public:
 		return chunks[sequence % ChunkCount].count != 0 ||
 		       completed.load(std::memory_order_acquire) != sequence;
 	}
-	void Drain() {
+	void Drain(const char* cause) {
 		Publish();
 		if (completed.load(std::memory_order_acquire) == sequence) return;
-		const RecordWait waiting;
+		const RecordWait waiting(cause);
 		for (auto done = completed.load(std::memory_order_acquire); done != sequence;
 		     done      = completed.load(std::memory_order_acquire))
 			completed.wait(done, std::memory_order_acquire);
@@ -253,7 +263,7 @@ private:
 	void WaitForRoom() {
 		auto done = completed.load(std::memory_order_acquire);
 		if (sequence - done < ChunkCount) return;
-		const RecordWait waiting;
+		const RecordWait waiting("queue full");
 		for (; sequence - done >= ChunkCount; done = completed.load(std::memory_order_acquire))
 			completed.wait(done, std::memory_order_acquire);
 	}
@@ -295,11 +305,28 @@ private:
 			}
 			if (stopping.load(std::memory_order_acquire)) return;
 			auto& chunk = chunks[current % ChunkCount];
-			for (auto offset = chunk.first; offset != End;) {
+			// KYTY_HITCH_LOG_MS: a SLOW RecorderChunk line for a chunk that took that long to
+			// replay (a wait for a pipeline build in it logs its own SLOW LateBind line; the rest
+			// is the driver).
+			const double threshold   = SlowLog::HitchThreshold();
+			const auto   chunk_start = threshold > 0.0 ? std::chrono::steady_clock::now()
+			                                           : std::chrono::steady_clock::time_point {};
+			uint32_t     commands    = 0;
+			for (auto offset = chunk.first; offset != End; ++commands) {
 				const auto* header = reinterpret_cast<const Header*>(chunk.data.data() + offset);
 				header->execute(chunk.data.data() + header->payload);
 				if (header->destroy) header->destroy(chunk.data.data() + header->payload);
 				offset = header->next;
+			}
+			if (threshold > 0.0) {
+				const double ms = std::chrono::duration<double, std::milli>(
+				                      std::chrono::steady_clock::now() - chunk_start)
+				                      .count();
+				if (ms >= threshold) {
+					std::printf("[tsc %llu] SLOW RecorderChunk %.1f ms commands=%u\n",
+					            static_cast<unsigned long long>(__rdtsc()), ms, commands);
+					std::fflush(stdout);
+				}
 			}
 			chunk.used  = 0;
 			chunk.count = 0;
@@ -321,12 +348,12 @@ Stream*                              RecordingStream() {
 void InvalidateRawState() {
 	if (executing) executing->state_epoch.fetch_add(1, std::memory_order_relaxed);
 }
-[[gnu::noinline]] void BeforeDirect() {
+[[gnu::noinline]] void BeforeDirect(const char* call) {
 	if (producer) {
 		// Diagnostic (live timecensus, source DirectDrain): direct calls made while packets are
 		// pending.
 		if (producer->Pending()) KYTY_TIME_CENSUS(DirectDrain, 0);
-		producer->BeforeDirect();
+		producer->BeforeDirect(call);
 	}
 }
 
@@ -354,7 +381,7 @@ uint64_t RecordedWrites() {
 	return g_writing_calls + g_packets;
 }
 void Drain() {
-	if (producer) producer->Drain();
+	if (producer) producer->Drain("Drain");
 }
 bool PacketsEnabled() {
 	return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
@@ -376,6 +403,23 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
 		const auto count = segments.size();
 		writer.Command(
 		    [owner, copied, count, replay] { replay({copied.data(), count}, original); });
+	});
+}
+bool EnqueueStatePacket(ReplayPacket replay, std::span<const Segment> segments,
+                        std::shared_ptr<const void> owner) {
+	if (!PacketsEnabled() || !replay || segments.size() > 8) return false;
+	for (const auto& segment: segments)
+		if (segment.size && !segment.data) return false;
+	auto* stream = RecordingStream();
+	return stream->Enqueue([&](Writer& writer) {
+		std::array<Segment, 8> copied {};
+		for (size_t i = 0; i < segments.size(); ++i)
+			copied[i] = {writer.Copy(segments[i].data, segments[i].size), segments[i].size};
+		const auto count = segments.size();
+		writer.Command([owner, copied, count, replay] {
+			InvalidateRawState();
+			replay({copied.data(), count}, original);
+		});
 	});
 }
 bool DeferredSubmitEnabled() {
@@ -424,7 +468,7 @@ void WaitDeferredSubmits() {
 		g_deferred_done.wait(done, std::memory_order_acquire);
 }
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
-	if (producer) producer->BeforeDirect();
+	if (producer) producer->BeforeDirect("inline packet");
 	replay(segments, original);
 }
 ProducerScope::ProducerScope() {

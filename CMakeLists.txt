@@ -624,6 +624,11 @@ if(WIN32)
 	target_link_libraries(compile_thread_power_tests PRIVATE dxgi)
 endif()
 
+add_executable(pipeline_late_build_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineLateBuildTests.cpp")
+target_link_libraries(pipeline_late_build_tests PRIVATE Threads::Threads)
+target_include_directories(pipeline_late_build_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 # Paths past MAX_PATH are a Windows matter.
 if(WIN32)
 	add_executable(pipeline_binaries_long_path_tests EXCLUDE_FROM_ALL
@@ -803,6 +808,8 @@ if(BUILD_TESTING)
 	set_tests_properties(pipeline_build_attempts PROPERTIES TIMEOUT 15)
 	add_test(NAME compile_thread_power COMMAND $<TARGET_FILE:compile_thread_power_tests>)
 	set_tests_properties(compile_thread_power PROPERTIES TIMEOUT 15)
+	add_test(NAME pipeline_late_build COMMAND $<TARGET_FILE:pipeline_late_build_tests>)
+	set_tests_properties(pipeline_late_build PROPERTIES TIMEOUT 15)
 	if(WIN32)
 		add_test(NAME pipeline_binaries_long_path COMMAND $<TARGET_FILE:pipeline_binaries_long_path_tests>)
 		set_tests_properties(pipeline_binaries_long_path PROPERTIES TIMEOUT 15)
@@ -902,6 +909,7 @@ if(BUILD_TESTING)
 		static_cache_readiness_tests
 		pipeline_build_attempt_tests
 		compile_thread_power_tests
+		pipeline_late_build_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -1025,9 +1033,13 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	endforeach()
 	add_executable(vulkan_recording_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/VulkanRecordingTests.cpp"
-		"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
+		"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}"
+		"${KYTY_SOURCE_DIR}/local/local-platform.cpp")
 	target_include_directories(vulkan_recording_tests PRIVATE ${inc_headers} "${CMAKE_CURRENT_BINARY_DIR}")
-	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
+	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers ${CMAKE_DL_LIBS})
+	if(WIN32)
+		target_link_libraries(vulkan_recording_tests PRIVATE dxgi)
+	endif()
 
 	foreach(native_resource_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests
 			resource_tracking_tests resource_materialization_tests)

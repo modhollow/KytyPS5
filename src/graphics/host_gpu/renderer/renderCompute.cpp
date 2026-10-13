@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLateBind.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -709,8 +710,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	TableDispatchSeen(sh_ctx.GetCs(), nullptr, use_thread_dimensions);
 #endif
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
+	// A pipeline no cache holds may still be compiling: the bind below waits for it on the
+	// recording worker while this thread goes on (PipelineLateBind).
+	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+		const PipelineLateBind::Scope late_bind;
+		return m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
+	}();
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 3);
 	NativePreparationScratch<PreparedBindings> binding_storage(
 	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);
@@ -811,7 +816,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	PipelineLateBind::BindPipeline(vk_buffer, vk::PipelineBindPoint::eCompute, pipeline);
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.sType               = vk::StructureType::eBufferMemoryBarrier;

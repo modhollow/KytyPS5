@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLateBind.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -598,8 +599,9 @@ static bool UsesIndexedViewports(const ShaderVertexInputInfo& input) {
 
 void RenderExecutor::CommitGraphicsState(CommandBuffer& buffer, const ShaderVertexInputInfo& input,
                                          const RenderColorInfo* colors, uint32_t color_count,
-                                         const RenderDepthInfo& depth, vk::Pipeline pipeline,
-                                         vk::ImageAspectFlags feedback_aspects) {
+                                         const RenderDepthInfo&         depth,
+                                         const PipelineCache::Pipeline& pipeline,
+                                         vk::ImageAspectFlags           feedback_aspects) {
 	const auto vk_buffer = buffer.Handle();
 	// The direct path binds the pipeline, the dynamic state and (just before, in
 	// CommitIndexBuffer) the index buffer: a native XPR draw after it must bind its own again.
@@ -609,7 +611,7 @@ void RenderExecutor::CommitGraphicsState(CommandBuffer& buffer, const ShaderVert
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+	PipelineLateBind::BindPipeline(vk_buffer, vk::PipelineBindPoint::eGraphics, pipeline);
 }
 
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -1566,10 +1568,15 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info,
-	    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
-	    primitive_restart_enable, state.programs.vertex, state.programs.pixel);
+	// A pipeline no cache holds may still be compiling: CommitGraphicsState's bind waits for it on
+	// the recording worker while this thread goes on (PipelineLateBind).
+	auto& pipeline = [&]() -> PipelineCache::Pipeline& {
+		const PipelineLateBind::Scope late_bind;
+		return m_context.GetPipelineCache().CreateGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info,
+		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+		    primitive_restart_enable, state.programs.vertex, state.programs.pixel);
+	}();
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1578,6 +1585,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	const auto primitive = ucfg.GetPrimType();
 	record_draw = LocalVulkanRecording::PacketsEnabled() && !mesh_active && emit.gpu_args == 0 &&
+	              !PipelineLateBind::Pending(pipeline) &&
 	              ((!set_bind_debug && !set_auto_debug) ||
 	               kyty_local_draw_packets_mode.load(std::memory_order_relaxed) != 0) &&
 	              (primitive == Prospero::PrimitiveType::kPointList ||
@@ -1635,7 +1643,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LiveCounters::Add(LiveCounters::DirectDraws);
 		if (mesh_active) LiveCounters::Add(LiveCounters::MeshDraws);
 		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count,
-		                    state.depth_info, pipeline.pipeline, feedback_aspects);
+		                    state.depth_info, pipeline, feedback_aspects);
 	} else {
 		buffer.InvalidateGraphicsState();
 	}
