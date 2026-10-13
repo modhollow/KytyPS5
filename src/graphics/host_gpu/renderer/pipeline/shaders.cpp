@@ -416,7 +416,8 @@ void CreatePipelineInternal(
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache,
     bool native_bindings, PipelineBuild build) {
 	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::GraphicsContext(
-	    vs_input_info, ps_input_info, build, graphics.pipeline_cache_control_enabled));
+	    vs_input_info, ps_input_info, build, graphics.pipeline_cache_control_enabled,
+	    graphics.GetPhysicalDeviceProperties().apiVersion));
 	const bool                           ps_active = ps_input_info != nullptr;
 	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
 	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
@@ -760,7 +761,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
                             PipelineBuild build, bool native_bindings) {
 	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::ComputeContext(
-	    input_info, build, graphics.pipeline_cache_control_enabled));
+	    input_info, build, graphics.pipeline_cache_control_enabled,
+	    graphics.GetPhysicalDeviceProperties().apiVersion));
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};

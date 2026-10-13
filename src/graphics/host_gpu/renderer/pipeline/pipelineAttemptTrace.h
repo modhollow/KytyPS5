@@ -53,6 +53,7 @@ struct Context {
 	DriverCache           driver_cache                     = DriverCache::Unknown;
 	Mode                  mode                             = Mode::Full;
 	bool                  cache_control                    = false;
+	uint32_t              feedback_api_version             = 0;
 	bool                  operator==(const Context&) const = default;
 };
 struct Sample {
@@ -62,16 +63,21 @@ struct Sample {
 };
 struct Record {
 	Context    context {};
-	Operation  operation            = Operation::DriverCreate;
-	Cache      cache                = Cache::None;
-	uint64_t   flags                = 0;
-	bool       flags_available      = false;
-	ResultKind result_kind          = ResultKind::Unavailable;
-	int32_t    result               = 0;
-	uint64_t   wall_ns              = 0;
-	bool       wall_available       = false;
-	uint64_t   thread_cpu_ns        = 0;
-	bool       thread_cpu_available = false;
+	Operation  operation             = Operation::DriverCreate;
+	Cache      cache                 = Cache::None;
+	uint64_t   flags                 = 0;
+	bool       flags_available       = false;
+	ResultKind result_kind           = ResultKind::Unavailable;
+	int32_t    result                = 0;
+	uint64_t   wall_ns               = 0;
+	bool       wall_available        = false;
+	uint64_t   thread_cpu_ns         = 0;
+	bool       thread_cpu_available  = false;
+	bool       feedback_requested    = false;
+	bool       feedback_available    = false;
+	uint32_t   feedback_flags        = 0;
+	uint64_t   driver_duration_ns    = 0;
+	bool       application_cache_hit = false;
 };
 struct Observer {
 	Context context {};
@@ -134,6 +140,17 @@ public:
 		record_.result_kind = ResultKind::Boolean;
 		record_.result      = result ? 1 : 0;
 	}
+	void CreationFeedback(vk::Result result, const vk::PipelineCreationFeedback& feedback) {
+		record_.feedback_requested = true;
+		if (result != vk::Result::eSuccess ||
+		    !(feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid))
+			return;
+		record_.feedback_available = true;
+		record_.feedback_flags     = static_cast<VkPipelineCreationFeedbackFlags>(feedback.flags);
+		record_.driver_duration_ns = feedback.duration;
+		record_.application_cache_hit = bool(
+		    feedback.flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit);
+	}
 	Scope(const Scope&)            = delete;
 	Scope& operator=(const Scope&) = delete;
 
@@ -145,7 +162,7 @@ private:
 
 template <typename Info>
 uint64_t EffectiveFlags(const Info& info) {
-	// flags2 replaces the legacy flags when present. Read only; never attach feedback.
+	// flags2 replaces the legacy flags when present. Read only.
 	for (auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next != nullptr;
 	     next       = next->pNext) {
 		if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR)
@@ -157,9 +174,33 @@ uint64_t EffectiveFlags(const Info& info) {
 template <typename Info, typename Create>
 vk::Result Invoke(Operation operation, Cache cache_class, vk::PipelineCache cache, const Info& info,
                   Create& create) {
-	if (active == nullptr) return create(cache, info);
-	Scope      scope(operation, cache_class, EffectiveFlags(info), true);
-	const auto result = create(cache, info);
+	if (active == nullptr || active->sample == nullptr || active->emit == nullptr)
+		return create(cache, info);
+	Scope scope(operation, cache_class, EffectiveFlags(info), true);
+	bool  feedback_exists = false;
+	if (active->context.feedback_api_version >= VK_API_VERSION_1_3) {
+		for (auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next != nullptr;
+		     next       = next->pNext) {
+			if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO) {
+				feedback_exists = true;
+				break;
+			}
+		}
+	}
+	vk::Result result;
+	if (active->context.feedback_api_version >= VK_API_VERSION_1_3 && !feedback_exists) {
+		vk::PipelineCreationFeedback           feedback {};
+		vk::PipelineCreationFeedbackCreateInfo request {};
+		request.pNext                     = info.pNext;
+		request.pPipelineCreationFeedback = &feedback;
+		auto observed                     = info;
+		observed.pNext                    = &request;
+		result                            = create(cache, observed);
+		scope.CreationFeedback(result, feedback);
+	} else {
+		// Do not duplicate or take over a caller-owned feedback request.
+		result = create(cache, info);
+	}
 	scope.VulkanResult(result);
 	return result;
 }

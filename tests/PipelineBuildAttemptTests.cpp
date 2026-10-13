@@ -611,12 +611,13 @@ void ExerciseAttribution(const char* stage) {
 	                           Case::DisabledControl, Case::NullCache, Case::Full, Case::Optimize,
 	                           Case::Error, Case::BinarySuccess, Case::BinaryFallback,
 	                           Case::BinaryCapture, Case::BinaryClaimed, Case::BinaryKeyFailed}) {
-		const auto run = [&](bool enabled) {
+		const auto run = [&](bool enabled, uint32_t feedback_api = 0) {
 			Harness<Info> h;
 			TestStore store;
 			TestWriter writer;
 			AttributionClock clock;
 			auto observer = clock.Observer();
+			observer.context.feedback_api_version = feedback_api;
 			PipelineBuild mode = PipelineBuild::Fast;
 			auto fast = h.info;
 			fast.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
@@ -661,21 +662,192 @@ void ExerciseAttribution(const char* stage) {
 				for (const auto& record : clock.records) if (record.flags_available) calls.push_back(record);
 				Check(calls.size() == h.backend.requests.size(), prefix + "every real create call is recorded once");
 				if (calls.size() == h.backend.requests.size()) {
-					for (size_t n = 0; n < calls.size(); ++n)
+					for (size_t n = 0; n < calls.size(); ++n) {
 						Check(calls[n].context == observer.context && calls[n].flags == h.backend.requests[n].effective_flags &&
 						          calls[n].result_kind == Trace::ResultKind::Vulkan &&
 						          calls[n].result == static_cast<int32_t>(h.backend.requests[n].result),
-						      prefix + "trace agrees with callback sequence without feedback injection");
+						      prefix + "trace agrees with callback sequence");
+						Check(calls[n].feedback_requested == (feedback_api >= VK_API_VERSION_1_3) &&
+						          !calls[n].feedback_available && calls[n].driver_duration_ns == 0,
+						      prefix + "non-writing driver never invents feedback");
+					}
 				}
 			}
+			auto requests = h.backend.requests;
+			// Only the allowed local output request is excluded from comparison.
+			// All original chain types/flags/binary handles remain in the oracle.
+			for (auto& request: requests)
+				std::erase(request.chain_types,
+				           uint64_t(VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO));
 			return Outcome {result.first, HandleNumber(result.second.pipeline), result.second.unoptimized,
-			                h.backend.requests, h.backend.caches,
+			                requests, h.backend.caches,
 			                {h.backend.compiled_outputs, h.backend.ordinary_calls, h.backend.probes,
 			                 h.backend.binary_calls, h.backend.capture_calls, store.loads,
 			                 writer.captures, writer.copies, h.graphics.device.queries, h.graphics.device.destroys},
 			                h.graphics.device.last_key};
 		};
 		Check(run(false) == run(true), prefix + "trace off/on conserve calls, cache keys, pNext chain, results and outputs");
+		Check(run(false) == run(true, VK_API_VERSION_1_3),
+		      prefix + "feedback conserves all attempts, flags2/binary chains, keys, caches and handles");
+	}
+}
+
+// These adapters keep the same feature oracle runnable against the original
+// trace header for the missing-request regression; they do not change its expectations.
+template <typename Observer>
+void FeedbackApi(Observer& observer, uint32_t api_version) {
+	if constexpr (requires { observer.context.feedback_api_version; })
+		observer.context.feedback_api_version = api_version;
+}
+template <typename Record>
+void ExpectFeedback(const Record& record, bool requested, bool available, uint64_t duration,
+                    bool hit, const std::string& label) {
+	if constexpr (requires { record.feedback_requested; record.feedback_available;
+	                         record.driver_duration_ns; record.application_cache_hit; }) {
+		Check(record.feedback_requested == requested && record.feedback_available == available &&
+		          record.driver_duration_ns == duration && record.application_cache_hit == hit,
+		      label);
+	} else {
+		Check(!requested && !available && duration == 0 && !hit, label);
+	}
+}
+
+template <typename Info>
+void ExerciseFeedback(const char* stage) {
+	namespace Trace = PipelineAttemptTrace;
+	const std::string prefix = std::string(stage) + " creation feedback: ";
+	for (unsigned scenario = 0; scenario < 9; ++scenario) {
+		Harness<Info> h;
+		AttributionClock clock;
+		auto observer = clock.Observer();
+		const bool enabled = scenario != 5;
+		const bool supported = scenario != 6;
+		const bool existing = scenario == 7;
+		FeedbackApi(observer, supported ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2);
+		vk::PipelineCreateFlags2CreateInfoKHR flags2 {};
+		flags2.flags = vk::PipelineCreateFlagBits2KHR::eDisableOptimization;
+		flags2.pNext = h.info.pNext;
+		h.info.pNext = &flags2;
+		const auto original_flags2 = flags2;
+		vk::PipelineCreationFeedback existing_output {};
+		vk::PipelineCreationFeedbackCreateInfo existing_info {};
+		if (existing) {
+			existing_info.pNext = h.info.pNext;
+			existing_info.pPipelineCreationFeedback = &existing_output;
+			h.info.pNext = &existing_info;
+		}
+		const auto original = h.info;
+		unsigned calls = 0;
+		const bool requested = enabled && supported && !existing;
+		const vk::Result scripted = scenario == 3 ? vk::Result::eErrorUnknown :
+		                            scenario == 4 ? vk::Result::ePipelineCompileRequired :
+		                                            vk::Result::eSuccess;
+		auto create = [&](vk::PipelineCache cache, const Info& input) {
+			++calls;
+			Check(cache == h.driver_cache, prefix + "cache argument is preserved");
+			auto unchanged = input;
+			unchanged.pNext = original.pNext;
+			// Compare defined Vulkan fields; struct padding is not an input contract.
+			Check(unchanged == original,
+			      prefix + "all original create-info fields are preserved");
+			const auto* node = Find(input.pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
+			Check((node != nullptr) == (requested || existing),
+			      prefix + "supported active trace requests driver feedback (RED oracle)");
+			if (requested && node != nullptr) {
+				const auto* feedback = reinterpret_cast<const VkPipelineCreationFeedbackCreateInfo*>(node);
+				Check(input.pNext == node && feedback->pNext == original.pNext &&
+				          feedback->pipelineStageCreationFeedbackCount == 0 &&
+				          feedback->pPipelineStageCreationFeedbacks == nullptr &&
+				          feedback->pPipelineCreationFeedback != nullptr,
+				      prefix + "one whole-pipeline request preserves the original chain");
+				if (feedback->pPipelineCreationFeedback != nullptr) {
+					Check(feedback->pPipelineCreationFeedback->flags == 0 &&
+					          feedback->pPipelineCreationFeedback->duration == 0,
+					      prefix + "feedback starts zeroed for each attempt");
+					feedback->pPipelineCreationFeedback->flags = scenario == 2 ? 0 :
+					    VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT |
+					    (scenario == 0 ? VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT : 0);
+					feedback->pPipelineCreationFeedback->duration = scenario == 8 ? 0 : 123456;
+				}
+			} else {
+				Check(input.pNext == original.pNext, prefix + "skipped feedback preserves exact chain head");
+			}
+			clock.wall += 500000;
+			clock.cpu += 200000;
+			return scripted;
+		};
+		vk::Result result;
+		{
+			Trace::ScopedObserver active(enabled ? &observer : nullptr);
+			result = Trace::Invoke(Trace::Operation::DriverCreate, Trace::Cache::Driver,
+			                       h.driver_cache, h.info, create);
+		}
+		Check(calls == 1 && result == scripted && h.info == original &&
+		          flags2 == original_flags2,
+		      prefix + "one unchanged call preserves result and caller storage");
+		Check(clock.records.size() == (enabled ? 1u : 0u), prefix + "existing trace record count is preserved");
+		if (!clock.records.empty()) {
+			Check(clock.records[0].flags == static_cast<VkPipelineCreateFlags2KHR>(flags2.flags),
+			      prefix + "feedback leaves effective flags2 attribution intact");
+			const bool available = requested && scripted == vk::Result::eSuccess && scenario != 2;
+			ExpectFeedback(clock.records[0], requested, available,
+			               available && scenario != 8 ? 123456u : 0u,
+			               available && scenario == 0, prefix + "reported feedback is explicit and result-safe");
+		}
+		Check(enabled || clock.samples == 0, prefix + "disabled trace performs no clock calls");
+	}
+	{
+		Harness<Info> h;
+		AttributionClock clock;
+		auto observer = clock.Observer();
+		FeedbackApi(observer, VK_API_VERSION_1_3);
+		unsigned calls = 0;
+		auto create = [&](vk::PipelineCache, const Info& input) {
+			const auto* node = Find(input.pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
+			Check(node != nullptr, prefix + "each repeat has its own request");
+			if (node != nullptr) {
+				const auto* request = reinterpret_cast<const VkPipelineCreationFeedbackCreateInfo*>(node);
+				Check(request->pPipelineCreationFeedback->flags == 0 &&
+				          request->pPipelineCreationFeedback->duration == 0,
+				      prefix + "previous valid feedback cannot leak into a non-writing repeat");
+				if (calls == 0) {
+					request->pPipelineCreationFeedback->flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
+					request->pPipelineCreationFeedback->duration = 700;
+				}
+			}
+			++calls;
+			return vk::Result::eSuccess;
+		};
+		{
+			Trace::ScopedObserver active(&observer);
+			for (unsigned n = 0; n < 2; ++n)
+				Trace::Invoke(Trace::Operation::DriverCreate, Trace::Cache::None, nullptr, h.info, create);
+		}
+		Check(calls == 2 && clock.records.size() == 2, prefix + "repeated creates remain separate");
+		if (clock.records.size() == 2) {
+			ExpectFeedback(clock.records[0], true, true, 700, false, prefix + "first reported duration");
+			ExpectFeedback(clock.records[1], true, false, 0, false, prefix + "non-writing repeat stays unknown");
+		}
+	}
+	for (bool missing_sample: {false, true}) {
+		Harness<Info> h;
+		AttributionClock clock;
+		auto observer = clock.Observer();
+		FeedbackApi(observer, VK_API_VERSION_1_3);
+		if (missing_sample) observer.sample = nullptr;
+		else observer.emit = nullptr;
+		unsigned calls = 0;
+		auto create = [&](vk::PipelineCache, const Info& input) {
+			++calls;
+			Check(input.pNext == h.info.pNext, prefix + "invalid observer never injects feedback");
+			return vk::Result::eErrorUnknown;
+		};
+		{
+			Trace::ScopedObserver active(&observer);
+			Check(Trace::Invoke(Trace::Operation::DriverCreate, Trace::Cache::None, nullptr, h.info, create) ==
+			          vk::Result::eErrorUnknown, prefix + "invalid observer preserves result");
+		}
+		Check(calls == 1 && clock.samples == 0 && clock.records.empty(), prefix + "invalid observer has no diagnostic work");
 	}
 }
 
@@ -686,6 +858,8 @@ int main() {
 	Exercise<vk::GraphicsPipelineCreateInfo>("graphics");
 	ExerciseAttribution<vk::ComputePipelineCreateInfo>("compute");
 	ExerciseAttribution<vk::GraphicsPipelineCreateInfo>("graphics");
+	ExerciseFeedback<vk::ComputePipelineCreateInfo>("compute");
+	ExerciseFeedback<vk::GraphicsPipelineCreateInfo>("graphics");
 	std::printf("PipelineBuildAttemptTests: %u failures (CPU model; no Vulkan driver).\n",
 	            failures);
 	return failures == 0 ? 0 : 1;
