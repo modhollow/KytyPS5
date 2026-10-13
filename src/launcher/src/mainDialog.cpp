@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
+#include "launchProfile.h"
 #include "patchesDialog.h"
 #include "updateChecker.h"
 
@@ -381,7 +382,7 @@ static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList
 }
 #endif
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
+bool MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
 
 	QFileInfo f(interpreter);
@@ -391,15 +392,21 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	if (args.isEmpty()) {
 		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
 		QApplication::quit();
-		return;
+		return false;
 	}
+	auto environment = QProcessEnvironment::systemEnvironment();
+	if (const auto error = LauncherProfile::Apply(interpreter, &environment); !error.isEmpty()) {
+		QMessageBox::critical(this, tr("Error"), error);
+		return false;
+	}
+	process->setProcessEnvironment(environment);
 
 #ifdef __linux__
 	auto bash_file_name = dir.filePath(KYTY_BASH_FILE);
 	if (!CreateBashScript(interpreter, args, bash_file_name)) {
 		QMessageBox::critical(this, tr("Error"), tr("Can't create file:\n") + bash_file_name);
 		QApplication::quit();
-		return;
+		return false;
 	}
 
 	{
@@ -448,10 +455,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		QMessageBox::critical(
 		    this, tr("Error"),
 		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));
-		return;
+		return false;
 	}
 #endif
 	process->waitForFinished(100);
+	return process->state() != QProcess::NotRunning;
 }
 
 void MainDialog::WriteSettings(QSettings& s) {
@@ -493,12 +501,11 @@ void MainDialogPrivate::Run() {
 		return;
 	}
 
-	m_running_item->SetRunning(true);
-
 	Configuration info;
 	info.CopyFrom(m_running_item->GetInfo());
 	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
-	m_main_dialog->RunInterpreter(&m_process, info);
+	LauncherProfile::StartGame(*m_running_item,
+	                           [&] { return m_main_dialog->RunInterpreter(&m_process, info); });
 
 	Update();
 }

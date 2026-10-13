@@ -133,10 +133,11 @@ public:
 		std::filesystem::path out;     // what was compiled, as a warmup file (optional)
 		bool static_inputs = false;    // out: the one the emulator's shader prefetch reads
 		std::filesystem::path timings; // each pipeline's compile time (optional)
-		uint32_t              shard     = 0;
-		uint32_t              shards    = 1;
-		uint32_t              threads   = 1;
-		bool                  pipelines = true;
+		uint32_t              shard        = 0;
+		uint32_t              shards       = 1;
+		bool                  shard_blocks = false; // contiguous slices instead of every n-th item
+		uint32_t              threads      = 1;
+		bool                  pipelines    = true;
 		// Compute seeds translated for this host subgroup size instead of the one they were listed
 		// or recorded with (0: as they were): kyty_shader_precompile passes the GPU's
 		// (GetComputeProgram's), --amd what a GPU running wave64 programs natively (AMD RDNA3)

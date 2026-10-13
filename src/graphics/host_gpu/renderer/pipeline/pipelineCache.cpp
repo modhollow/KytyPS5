@@ -14,6 +14,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineAttemptTraceRuntime.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaries.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheFile.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLateBind.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLateBuild.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -31,6 +33,12 @@
 #include "slow-log.h"
 #include "startup-progress.h"
 #include "staticInputProducer.h"
+#ifdef KYTY_STATIC_PRECOMPILE
+#include "graphics/host_gpu/renderer/pipeline/precompileSchedule.h"
+#endif
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1384,7 +1392,9 @@ struct PipelineCache::ProgramCache {
 	std::vector<Permutation*>              warm_permutations;
 	std::chrono::steady_clock::time_point  warm_deadline =
 	    std::chrono::steady_clock::time_point::max();
-	uint32_t RecordedIndex(const ShaderProgram& program) const {
+	// The workers that build pipelines recorded draws and dispatches wait for (PipelineLateBind).
+	std::shared_ptr<CompileWorkers> load_workers;
+	uint32_t                        RecordedIndex(const ShaderProgram& program) const {
 		const auto it = recorded_programs.find(program.id);
 		return it == recorded_programs.end() ? LocalShaderWarmup::NoShader : it->second;
 	}
@@ -1558,6 +1568,132 @@ PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
 	return *m_optimize_workers;
 }
 
+namespace {
+
+// A pipeline a worker builds for draws or dispatches recorded already (PipelineLateBind): its
+// handle and whether that is the unoptimized build (PipelineBuild::Fast).
+struct LateResult {
+	vk::Pipeline pipeline    = nullptr;
+	bool         unoptimized = false;
+};
+using LateBuild = PipelineLateBuild::Build<LateResult>;
+
+// Those pipelines until their cache takes the finished ones (PromoteOptimized).
+using LatePipelines = PipelineLateBuild::Pending<PipelineCache::Pipeline, LateResult>;
+LatePipelines g_late_pipelines;
+
+// A caller that cannot bind a pending pipeline late waits for its build here.
+void AwaitLate(const LateBuild& build) {
+	if (build.Done()) return;
+	SlowLog::Scope slow([](double ms) { std::printf("SLOW AwaitLatePipeline %.1f ms\n", ms); },
+	                    SlowLog::HitchThreshold());
+	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
+	(void)build.Wait();
+}
+
+// A TryCreate caller's completion to wait for (PipelineCache::PipelineWaiting).
+std::shared_ptr<const std::atomic<bool>> LateWaiting(std::shared_ptr<LateBuild> build) {
+	const auto& done = build->DoneFlag();
+	return {std::move(build), &done};
+}
+
+// The recording worker's waits for them (the summary at the end).
+std::atomic<uint64_t> g_late_waits {0}, g_late_wait_us {0}, g_late_longest_wait_us {0};
+
+thread_local bool g_late_bind_allowed = false;
+
+// A pipeline no cache holds starts on the load workers: its caller binds it late, and the Vulkan
+// recording worker records its commands.
+bool LateBuildStarts() {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	return PipelineLateBuild::CanStart(g_late_bind_allowed, LocalVulkanRecording::PacketsEnabled());
+#else
+	return false;
+#endif
+}
+
+// Normal priority, never behind the background pools' queues: the recording worker, and with it
+// the frame, waits for these. A whole core each (unoptimized compiles scaled to 7.8 of 8
+// threads in one process).
+template <typename Workers>
+Workers& LoadWorkers(std::shared_ptr<Workers>& workers) {
+	if (workers == nullptr) {
+		workers = std::make_shared<Workers>(std::max(2u, std::thread::hardware_concurrency() / 2u),
+		                                    false, "load");
+	}
+	return *workers;
+}
+
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+struct LateBind {
+	vk::CommandBuffer     command;
+	vk::PipelineBindPoint point;
+	const LateBuild*      build; // (kept alive by the packet)
+};
+
+// On the recording worker, in command order: the bind waits for its pipeline's build.
+void ReplayLateBind(std::span<const LocalVulkanRecording::Segment> segments,
+                    const vk::detail::DispatchLoaderDynamic&       dispatch) {
+	const auto& bind = *static_cast<const LateBind*>(segments[0].data);
+	if (!bind.build->Done()) {
+		const auto begin = std::chrono::steady_clock::now();
+		(void)bind.build->Wait();
+		const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                          std::chrono::steady_clock::now() - begin)
+		                                          .count());
+		g_late_waits.fetch_add(1, std::memory_order_relaxed);
+		g_late_wait_us.fetch_add(us, std::memory_order_relaxed);
+		for (auto longest = g_late_longest_wait_us.load(std::memory_order_relaxed);
+		     us > longest && !g_late_longest_wait_us.compare_exchange_weak(longest, us);) {
+		}
+		if (const double threshold = SlowLog::HitchThreshold();
+		    threshold > 0.0 && static_cast<double>(us) / 1000.0 >= threshold) {
+			std::printf("[tsc %llu] SLOW LateBind wait %.1f ms\n",
+			            static_cast<unsigned long long>(__rdtsc()),
+			            static_cast<double>(us) / 1000.0);
+			std::fflush(stdout);
+		}
+	}
+	bind.command.bindPipeline(bind.point, bind.build->Wait().pipeline, dispatch);
+}
+#endif
+
+} // namespace
+
+PipelineLateBind::Scope::Scope(): m_outer(g_late_bind_allowed) {
+	g_late_bind_allowed = true;
+}
+
+PipelineLateBind::Scope::~Scope() {
+	g_late_bind_allowed = m_outer;
+}
+
+bool PipelineLateBind::Allowed() {
+	return g_late_bind_allowed;
+}
+
+void PipelineLateBind::BindPipeline(vk::CommandBuffer command, vk::PipelineBindPoint point,
+                                    const PipelineCache::Pipeline& pipeline) {
+	if (!Pending(pipeline)) {
+		command.bindPipeline(point, pipeline.pipeline);
+		return;
+	}
+	const auto build = g_late_pipelines.Find(pipeline);
+	EXIT_IF(build == nullptr);
+	PipelineLateBuild::Bind(
+	    build, [&](const LateResult& result) { command.bindPipeline(point, result.pipeline); },
+	    [&](const std::shared_ptr<LateBuild>& pending) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		    const LateBind                      bind {command, point, pending.get()};
+		    const LocalVulkanRecording::Segment segments[] {{&bind, sizeof(bind)}};
+		    return LocalVulkanRecording::EnqueueStatePacket(ReplayLateBind, segments, pending);
+#else
+		    (void)pending;
+		    return false;
+#endif
+	    });
+}
+
 // A pipeline no cache holds: compiled unoptimized now (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)
 // and optimized on a worker, or optimized before its first use (up to seconds on NVIDIA).
 // Unoptimized first only on NVIDIA, where it was measured (~100x faster to compile) and tested. An
@@ -1606,6 +1742,14 @@ void PipelineCache::PromoteFinished() {
 // (native XPR records never look it up again). The unoptimized pipeline stays alive until this
 // cache is destroyed: commands recorded before may still use it.
 void PipelineCache::PromoteOptimized() {
+	// The pipelines workers built for recorded draws and dispatches (PipelineLateBind) get their
+	// handles here, and their optimized builds start as those of pipelines built here do.
+	g_late_pipelines.Take(this, false, [this](LatePipelines::Entry& entry) {
+		const auto& result          = entry.build->Wait();
+		entry.pipeline->pipeline    = result.pipeline;
+		entry.pipeline->unoptimized = result.unoptimized;
+		BuildOptimized(*entry.pipeline, std::move(entry.optimize));
+	});
 	const auto finished = m_optimized_builds.load(std::memory_order_acquire);
 	if (finished == m_promoted_builds) return;
 	m_promoted_builds = finished;
@@ -1638,6 +1782,20 @@ void PipelineCache::MainPipelineDone() {
 }
 
 void PipelineCache::FinishCompileWorkers() {
+	// Pipelines recorded draws and dispatches wait for: every one is built (queued ones too) and
+	// taken, without its optimized build.
+	m_program_cache->load_workers.reset();
+	g_late_pipelines.Take(this, true, [](LatePipelines::Entry& entry) {
+		const auto& result          = entry.build->Wait();
+		entry.pipeline->pipeline    = result.pipeline;
+		entry.pipeline->unoptimized = result.unoptimized;
+	});
+	if (const auto started = g_late_pipelines.Started(); started != 0) {
+		PipelineCacheLog("Pipelines built while their draws and dispatches were recorded: {}; the "
+		                 "recording worker waited for {} of them, {} ms in all (longest {} ms)",
+		                 started, g_late_waits.load(), g_late_wait_us.load() / 1000u,
+		                 g_late_longest_wait_us.load() / 1000u);
+	}
 	m_table_cache_saver = {}; // (stops and joins it)
 	if (auto& prefetch = m_program_cache->prefetch; prefetch != nullptr) {
 		if (prefetch->ready.load(std::memory_order_acquire))
@@ -1682,7 +1840,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	m_program_cache->push_job = [this](std::function<void()> job) {
 		TableWorkers().Push(std::move(job));
 	};
+	// Not the emulator's driver cache in the static precompile: it compiles through caches of its
+	// own, and a driver cache the game filled hands the driver its trained compression dictionary,
+	// whose binaries only this PC reads (every one would be left out).
+#ifdef KYTY_STATIC_PRECOMPILE
+	PipelineCacheLog(
+	    "Vulkan pipeline cache: the emulator's is not loaded by the static precompile");
+#else
 	InitializeDriverCache();
+#endif
 	StartupProgress::Report("Loading the pipeline cache", 0, 0);
 	InitializeStaticCache(false);
 	// Not in the static precompile: a shell that ran the game passes its KYTY_SHADER_WARMUP(_ONLY)
@@ -2600,17 +2766,35 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	}
 
 	const bool indexed = kyty_local_pipeline_index_mode.load(std::memory_order_relaxed) != 0;
+	// One a worker still builds for recorded draws (PipelineLateBind): still compiling for an
+	// `async` caller, taken by a caller that binds it late, waited for here by others.
+	const auto ready = [&](Pipeline* pipeline) -> Pipeline* {
+		if (!PipelineLateBind::Pending(*pipeline) || (!async && PipelineLateBind::Allowed())) {
+			return pipeline;
+		}
+		auto build = g_late_pipelines.Find(*pipeline);
+		if (build == nullptr) {
+			return pipeline;
+		}
+		if (async) {
+			m_pipeline_waiting = LateWaiting(std::move(build));
+			return nullptr;
+		}
+		AwaitLate(*build);
+		PromoteOptimized();
+		return pipeline;
+	};
 	if (indexed) {
 		if (auto found = m_native_graphics_pipelines.find(key);
 		    found != m_native_graphics_pipelines.end()) {
-			return found->second;
+			return ready(found->second);
 		}
 	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		if (indexed) {
 			m_native_graphics_pipelines.emplace(key, iter->second.get());
 		}
-		return iter->second.get();
+		return ready(iter->second.get());
 	}
 
 	if (async) {
@@ -2700,6 +2884,92 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	std::optional<ShaderPixelInputInfo> pixel_info;
+	if (ps_active) pixel_info = *ps_input_info;
+	const auto optimize = [this, rendering, vertex_input = key.vertex_input, vs_input_info,
+	                       pixel_info, vertex_program, pixel_program, static_params,
+	                       native_bindings](Pipeline& layouts) {
+		CreatePipelineInternal(m_graphics, layouts, rendering, vertex_input, vs_input_info,
+		                       vertex_program, pixel_info ? &*pixel_info : nullptr, pixel_program,
+		                       static_params, m_driver_cache, native_bindings,
+		                       PipelineBuild::Optimize);
+	};
+	const auto record_recipe = [&](const GraphicsPipelineKey& stored) {
+		// Warmup recipes describe the normal variant only.
+		if (native_bindings) {
+			return;
+		}
+		LocalShaderWarmup::PipelineRecord recipe;
+		recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
+		recipe.pixel =
+		    ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
+		recipe.rendering    = stored.rendering;
+		recipe.vertex_input = stored.vertex_input;
+		recipe.state        = stored.static_params;
+		if (recipe.vertex != LocalShaderWarmup::NoShader &&
+		    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
+			m_program_cache->warmup.AddPipeline(recipe);
+		}
+	};
+	const auto build = FirstBuild(m_graphics);
+
+	if (LateBuildStarts()) {
+		// Its layouts now (its draw binds them), the pipeline on a worker: the draw's bind waits
+		// for it on the recording worker (PipelineLateBind::BindPipeline).
+		auto cached = std::make_unique<Pipeline>();
+		{
+			PipelineAttemptTraceRuntime::CallerScope trace_caller(
+			    PipelineAttemptTrace::Caller::Foreground, PipelineAttemptTrace::DriverCache::Main);
+			PipelineAttemptTraceRuntime::Session attempt_trace(
+			    PipelineAttemptTraceRuntime::GraphicsContext(
+			        vs_input_info, ps_input_info, build,
+			        m_graphics.pipeline_cache_control_enabled));
+			PipelineLateBind::CreatePipelineLayouts(m_graphics, *cached, vs_input_info,
+			                                        vertex_program, ps_input_info, pixel_program,
+			                                        native_bindings);
+		}
+		auto late = PipelineLateBuild::Start<LateResult>(
+		    true, LoadWorkers(m_program_cache->load_workers),
+		    [this, layouts = *cached, rendering, vertex_input = key.vertex_input, vs_input_info,
+		     pixel_info, vertex_program, pixel_program, static_params, native_bindings,
+		     build]() mutable {
+			    const auto*    pixel = pixel_info ? &*pixel_info : nullptr;
+			    SlowLog::Scope slow(
+			        [&](double ms) {
+				        std::printf("SLOW LoadGraphicsPipeline %.1f ms VS=0x%016llx PS=0x%016llx\n",
+				                    ms,
+				                    static_cast<unsigned long long>(
+				                        vs_input_info.stage.program->shader_hash),
+				                    static_cast<unsigned long long>(
+				                        pixel != nullptr ? pixel->stage.program->shader_hash : 0));
+			        },
+			        SlowLog::HitchThreshold());
+			    PipelineAttemptTraceRuntime::CallerScope trace_caller(
+			        PipelineAttemptTrace::Caller::LoadWorker,
+			        PipelineAttemptTrace::DriverCache::Main);
+			    PipelineAttemptTraceRuntime::Session attempt_trace(
+			        PipelineAttemptTraceRuntime::GraphicsContext(
+			            vs_input_info, pixel, build, m_graphics.pipeline_cache_control_enabled));
+			    const PipelineLateBind::LayoutsGiven given;
+			    CreatePipelineInternal(m_graphics, layouts, rendering, vertex_input, vs_input_info,
+			                           vertex_program, pixel, pixel_program, static_params,
+			                           m_driver_cache, native_bindings, build);
+			    PipelineAttemptTrace::Scope trace_bookkeeping(
+			        PipelineAttemptTrace::Operation::Bookkeeping);
+			    MainPipelineDone();
+			    EXIT_NOT_IMPLEMENTED(layouts.pipeline == nullptr);
+			    return LateResult {layouts.pipeline, layouts.unoptimized};
+		    });
+		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+		EXIT_IF(!inserted);
+		if (indexed) {
+			m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+		}
+		g_late_pipelines.Add({this, iter->second.get(), std::move(late), optimize});
+		record_recipe(iter->first);
+		return iter->second.get();
+	}
+
 	SlowLog::Scope create_slow(
 	    [&](double ms) {
 		    std::printf("SLOW CreateGraphicsPipeline %.1f ms VS=%llu PS=%llu\n", ms,
@@ -2710,7 +2980,6 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
 	auto                  cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	const auto                               build = FirstBuild(m_graphics);
 	PipelineAttemptTraceRuntime::CallerScope trace_caller(PipelineAttemptTrace::Caller::Foreground,
 	                                                      PipelineAttemptTrace::DriverCache::Main);
 	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::GraphicsContext(
@@ -2730,31 +2999,8 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	if (indexed) {
 		m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
 	}
-	std::optional<ShaderPixelInputInfo> pixel_info;
-	if (ps_active) pixel_info = *ps_input_info;
-	BuildOptimized(*iter->second, [this, rendering, vertex_input = iter->first.vertex_input,
-	                               vs_input_info, pixel_info, vertex_program, pixel_program,
-	                               static_params, native_bindings](Pipeline& layouts) {
-		CreatePipelineInternal(m_graphics, layouts, rendering, vertex_input, vs_input_info,
-		                       vertex_program, pixel_info ? &*pixel_info : nullptr, pixel_program,
-		                       static_params, m_driver_cache, native_bindings,
-		                       PipelineBuild::Optimize);
-	});
-	// Warmup recipes describe the normal variant only.
-	if (native_bindings) {
-		return iter->second.get();
-	}
-	LocalShaderWarmup::PipelineRecord recipe;
-	recipe.vertex = m_program_cache->RecordedIndex(vertex_program);
-	recipe.pixel =
-	    ps_active ? m_program_cache->RecordedIndex(pixel_program) : LocalShaderWarmup::NoShader;
-	recipe.rendering    = iter->first.rendering;
-	recipe.vertex_input = iter->first.vertex_input;
-	recipe.state        = iter->first.static_params;
-	if (recipe.vertex != LocalShaderWarmup::NoShader &&
-	    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
-		m_program_cache->warmup.AddPipeline(recipe);
-	}
+	BuildOptimized(*iter->second, optimize);
+	record_recipe(iter->first);
 
 	return iter->second.get();
 }
@@ -2771,11 +3017,76 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		// One a worker still builds: a caller that cannot bind it late waits for it here.
+		if (PipelineLateBind::Pending(*iter->second) && !PipelineLateBind::Allowed()) {
+			if (const auto build = g_late_pipelines.Find(*iter->second); build != nullptr) {
+				AwaitLate(*build);
+				PromoteOptimized();
+			}
+		}
 		return *iter->second;
 	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);
+	}
+
+	const auto record_recipe = [&] {
+		LocalShaderWarmup::PipelineRecord recipe;
+		recipe.compute = m_program_cache->RecordedIndex(compute_program);
+		if (recipe.compute != LocalShaderWarmup::NoShader) {
+			m_program_cache->warmup.AddPipeline(recipe);
+		}
+	};
+	const auto optimize = [this, input_info, module = compute_program.module](Pipeline& layouts) {
+		CreatePipelineInternal(m_graphics, layouts, input_info, module, m_driver_cache,
+		                       PipelineBuild::Optimize);
+	};
+	const auto build = FirstBuild(m_graphics);
+
+	if (LateBuildStarts()) {
+		// Its layouts now (its dispatch binds them), the pipeline on a worker: the dispatch's bind
+		// waits for it on the recording worker (PipelineLateBind::BindPipeline).
+		auto cached = std::make_unique<Pipeline>();
+		{
+			PipelineAttemptTraceRuntime::CallerScope trace_caller(
+			    PipelineAttemptTrace::Caller::Foreground, PipelineAttemptTrace::DriverCache::Main);
+			PipelineAttemptTraceRuntime::Session attempt_trace(
+			    PipelineAttemptTraceRuntime::ComputeContext(
+			        input_info, build, m_graphics.pipeline_cache_control_enabled));
+			PipelineLateBind::CreatePipelineLayouts(m_graphics, *cached, input_info, false);
+		}
+		auto late = PipelineLateBuild::Start<LateResult>(
+		    true, LoadWorkers(m_program_cache->load_workers),
+		    [this, layouts = *cached, input_info, module = compute_program.module,
+		     build]() mutable {
+			    SlowLog::Scope slow(
+			        [&](double ms) {
+				        std::printf(
+				            "SLOW LoadComputePipeline %.1f ms CS=0x%016llx\n", ms,
+				            static_cast<unsigned long long>(input_info.stage.program->shader_hash));
+			        },
+			        SlowLog::HitchThreshold());
+			    PipelineAttemptTraceRuntime::CallerScope trace_caller(
+			        PipelineAttemptTrace::Caller::LoadWorker,
+			        PipelineAttemptTrace::DriverCache::Main);
+			    PipelineAttemptTraceRuntime::Session attempt_trace(
+			        PipelineAttemptTraceRuntime::ComputeContext(
+			            input_info, build, m_graphics.pipeline_cache_control_enabled));
+			    const PipelineLateBind::LayoutsGiven given;
+			    CreatePipelineInternal(m_graphics, layouts, input_info, module, m_driver_cache,
+			                           build);
+			    PipelineAttemptTrace::Scope trace_bookkeeping(
+			        PipelineAttemptTrace::Operation::Bookkeeping);
+			    MainPipelineDone();
+			    EXIT_NOT_IMPLEMENTED(layouts.pipeline == nullptr);
+			    return LateResult {layouts.pipeline, layouts.unoptimized};
+		    });
+		auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+		EXIT_IF(!inserted);
+		g_late_pipelines.Add({this, iter->second.get(), std::move(late), optimize});
+		record_recipe();
+		return *iter->second;
 	}
 
 	SlowLog::Scope create_slow(
@@ -2786,7 +3097,6 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	    SlowLog::HitchThreshold());
 	LiveCensus::WaitScope                    compiling(LiveCensus::WaitCompile);
 	auto                                     cached = std::make_unique<Pipeline>();
-	const auto                               build  = FirstBuild(m_graphics);
 	PipelineAttemptTraceRuntime::CallerScope trace_caller(PipelineAttemptTrace::Caller::Foreground,
 	                                                      PipelineAttemptTrace::DriverCache::Main);
 	PipelineAttemptTraceRuntime::Session attempt_trace(PipelineAttemptTraceRuntime::ComputeContext(
@@ -2801,16 +3111,8 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
-	BuildOptimized(*iter->second,
-	               [this, input_info, module = compute_program.module](Pipeline& layouts) {
-		               CreatePipelineInternal(m_graphics, layouts, input_info, module,
-		                                      m_driver_cache, PipelineBuild::Optimize);
-	               });
-	LocalShaderWarmup::PipelineRecord recipe;
-	recipe.compute = m_program_cache->RecordedIndex(compute_program);
-	if (recipe.compute != LocalShaderWarmup::NoShader) {
-		m_program_cache->warmup.AddPipeline(recipe);
-	}
+	BuildOptimized(*iter->second, optimize);
+	record_recipe();
 
 	return *iter->second;
 }
@@ -2828,8 +3130,17 @@ PipelineCache::TryCreateComputePipeline(const ShaderComputeInputInfo& input_info
 	EXIT_IF(!compute_program);
 	Common::LockGuard lock(m_mutex);
 	PromoteOptimized();
-	if (auto iter = m_compute_pipelines.find(compute_program.id); iter != m_compute_pipelines.end())
+	if (auto iter = m_compute_pipelines.find(compute_program.id);
+	    iter != m_compute_pipelines.end()) {
+		// One a worker still builds for a recorded dispatch (PipelineLateBind): still compiling.
+		if (PipelineLateBind::Pending(*iter->second)) {
+			if (auto build = g_late_pipelines.Find(*iter->second); build != nullptr) {
+				m_pipeline_waiting = LateWaiting(std::move(build));
+				return nullptr;
+			}
+		}
 		return iter->second.get();
+	}
 	if (auto pending = m_pending_compute_pipelines.find(compute_program.id);
 	    pending != m_pending_compute_pipelines.end()) {
 		if (!pending->second->done.load(std::memory_order_acquire)) {

@@ -5,7 +5,19 @@
 #                                         a driver that has VK_KHR_pipeline_binary (NVIDIA 5xx) the pipelines'
 #                                         binaries instead, <title>_<version>.binaries, read only when a pipeline is
 #                                         needed (the driver copies a whole .bin into memory: GBs)
-#   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 3 threads each on the allowed CPUs)
+#   .\precompile-windows.ps1 -Jobs 8      8 processes at a time (default: 2 threads each, as many as the allowed
+#                                         cores less one hold with their SMT siblings)
+#   .\precompile-windows.ps1 -RecordedOnly  only what recorded play uses (the specializations of recorded play, or the
+#                                         release's hints): about a fifth of the time; the rest is compiled when the
+#                                         game first needs it, or by a full run later (which keeps these);
+#                                         run-windows.ps1 -Prompt still offers that full run (<title>_<version>.partial)
+#   .\precompile-windows.ps1 -Minutes 15  a time budget: no shard starts after 15 minutes of compiling (the running
+#                                         ones finish: up to the longest shard over, then the merge), and what is
+#                                         done is kept (recorded play first); run it again to continue where it stopped
+#   .\precompile-windows.ps1 -Background -WhileProcess <pid>  the shards not finished yet, one idle process, while the
+#                                         game (that process) runs; no merge (the game has the store open)
+#   .\precompile-windows.ps1 -MergeOnly   the finished shards into the store, before the game starts; when every
+#                                         shard is finished, the precompile is complete (run-windows.ps1 does both)
 #   .\precompile-windows.ps1 -Coverage    no pipelines, only what the seeds compile to, for
 #                                         tools\local\static-precompile\precompile.py coverage
 #   .\precompile-windows.ps1 -InputsOnly  only the compiled inputs the emulator's shader prefetch
@@ -39,19 +51,36 @@ param(
 	# else the release's hints completed with the seed file's code (hinted-<title>_<version>.seeds).
 	[string]$Recorded = '*',
 	[int]$Jobs = 0,
-	[int]$Threads = 3,
+	[int]$Threads = 2,
 	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
 	[switch]$InputsOnly,
-	# Every allowed CPU at full power (the processes still below normal priority), instead of the cores less one at
-	# reduced power.
+	[switch]$RecordedOnly,
+	# A time budget in minutes of compiling (0: none; making seeds and hints and merging earlier shards come first
+	# and are not counted): no shard starts after it, the running ones finish, and the cache is merged as partial
+	# (no pruning; <title>_<version>.partial). A later run continues: the shards finished for the same inputs
+	# (<title>_<version>.done) are not run again.
+	[int]$Minutes = 0,
+	# While the game runs (run-windows.ps1 -BackgroundPrecompile): one process at idle priority with power saving,
+	# no merge; with -WhileProcess it stops when that process exits (the shard in progress is lost, the finished
+	# ones are listed in <title>_<version>.done and merged by the next -MergeOnly or precompile).
+	[switch]$Background,
+	[int]$WhileProcess = 0,
+	# Merge the finished shards and stop; when every shard is finished, also finish the precompile (the partial
+	# mark and the list removed, the prefetch inputs made).
+	[switch]$MergeOnly,
+	# Every allowed CPU (the processes still below normal priority), instead of the cores less one.
+	# Overrides EcoQoS.
 	[switch]$FullSpeed,
+	# Opt in to Windows EcoQoS power saving. Lower clocks/efficient cores can lengthen precompilation.
+	[switch]$EcoQoS,
 	# Print the processes, threads and power the run would use (JSON) and exit; -LogicalCpus/-PhysicalCores stand
 	# in for this PC's (tests).
 	[switch]$PlanOnly,
 	[int]$LogicalCpus = 0,
 	[int]$PhysicalCores = 0,
+	[int]$MemoryGB = 0,
 	# Only the first N shards of the seeds, and no merge after them (measuring the precompile: the static cache stays
 	# incomplete); 0: all.
 	[int]$ShardLimit = 0,
@@ -59,6 +88,8 @@ param(
 	[string]$Exe = $(if (Test-Path "$PSScriptRoot\kyty_shader_precompile.exe") { "$PSScriptRoot\kyty_shader_precompile.exe" } else { "$PSScriptRoot\_Build\windows\kyty_shader_precompile.exe" })
 )
 $ErrorActionPreference = 'Stop'
+# Where the precompiler runs (as the emulator does: it reads the launch configuration there).
+$toolDirectory = $PSScriptRoot
 if (!$CacheRoot) { $CacheRoot = if ($env:KYTY_PIPELINE_CACHE_ROOT) { $env:KYTY_PIPELINE_CACHE_ROOT } else { Join-Path $PSScriptRoot '_PipelineCache' } }
 $CacheRoot = [IO.Path]::GetFullPath($CacheRoot)
 $env:KYTY_PIPELINE_CACHE_ROOT = $CacheRoot
@@ -69,28 +100,48 @@ if ($Affinity -eq 0) {
 	foreach ($cpu in (Get-Content $config -Raw | ConvertFrom-Json).cpu_affinity) { $Affinity = $Affinity -bor ([int64]1 -shl [int]$cpu) }
 }
 if ($LogicalCpus -le 0) { $LogicalCpus = [Environment]::ProcessorCount }
-if ($PhysicalCores -le 0) { $PhysicalCores = [math]::Max(1, [int](Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum) }
+if ($PhysicalCores -le 0) {
+	$PhysicalCores = try { [math]::Max(1, [int](Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum) } catch { $LogicalCpus }
+}
 $all = if ($LogicalCpus -ge 64) { [int64]-1 } else { ([int64]1 -shl $LogicalCpus) - 1 }
 $mask = $Affinity -band $all
 if ($mask -eq 0) { $mask = $all }
 $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
 # The processes (Jobs), threads each and power of the shards, and the threads of the single-process steps (Budget).
-# A process scales to a few threads (4: 85%), and each translates the programs its share needs. By default the
-# allowed CPUs' share of the cores less one, at reduced power: an SMT sibling adds little compile throughput and the
-# most heat, and one core stays free for the rest of the PC. -FullSpeed: every allowed CPU at full power.
-function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$threads, [int]$jobs, [bool]$fullSpeed) {
+# By default the budget is the allowed CPUs' share of the cores less one, so one core stays free for the rest of
+# the PC. The shards' threads fill the budget's cores with their SMT siblings: a process compiles a big compute
+# pipeline nearly alone (the driver) while its other threads wait, so the CPU stays far below its threads (8 cores,
+# 16 threads: 2 processes of 3 threads kept 40 % of it busy; 7 of 2 about 80 %, in about half the time). A process
+# takes up to about 1 GB of memory: at most one per 1.5 GB. EcoQoS is opt-in because precompilation blocks game
+# launch. -FullSpeed: every allowed CPU, with EcoQoS disabled.
+function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$threads, [int]$jobs, [bool]$fullSpeed, [bool]$ecoQoS,
+	[int]$memoryGB) {
+	$memoryJobs = [math]::Max(1, [math]::Floor($memoryGB / 1.5))
 	if ($fullSpeed) {
-		if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Ceiling($cpus / $threads)) }
+		if ($jobs -le 0) { $jobs = [math]::Min($memoryJobs, [math]::Max(1, [math]::Ceiling($cpus / $threads))) }
 		return [pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$cpus; Efficient = $false }
 	}
 	$cores = [math]::Floor($cpus * [math]::Min($physical, $logical) / $logical)
 	$budget = [math]::Max(1, $cores - 1)
-	$threads = [math]::Min($threads, $budget)
-	if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Floor($budget / $threads)) }
-	[pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$budget; Efficient = $true }
+	# The budget's threads: its cores with their SMT siblings.
+	$budgetThreads = [math]::Max(1, [math]::Floor($budget * $logical / [math]::Min($physical, $logical)))
+	$threads = [math]::Min($threads, $budgetThreads)
+	if ($jobs -le 0) { $jobs = [math]::Min($memoryJobs, [math]::Max(1, [math]::Floor($budgetThreads / $threads))) }
+	[pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$budget; Efficient = $ecoQoS }
 }
-$plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent
+if ($MemoryGB -le 0) {
+	# Without the size (WMI unavailable) the memory does not limit the processes.
+	$MemoryGB = try { [int]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB) } catch { 0 }
+	if ($MemoryGB -le 0) { $MemoryGB = 1024 }
+}
+$plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent $EcoQoS.IsPresent $MemoryGB
+# In the background: one process of at most two threads, with power saving, next to the game; this script and
+# the steps it runs itself (the seed and hint files, the store probe) at idle priority too (children inherit it).
+if ($Background) {
+	$plan = [pscustomobject]@{ Jobs = 1; Threads = [math]::Min(2, $plan.Threads); Budget = 1; Efficient = $true }
+	try { (Get-Process -Id $PID).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Idle } catch {}
+}
 if ($PlanOnly) {
 	[pscustomobject]@{ Cpus = $cpus; Jobs = $plan.Jobs; Threads = $plan.Threads; Budget = $plan.Budget; Efficient = $plan.Efficient } |
 		ConvertTo-Json -Compress
@@ -203,6 +254,56 @@ if ($Recorded -eq '*') {
 		}
 	}
 }
+# The shards an earlier run finished (<title>_<version>.done: the inputs they were made from, then one shard
+# name a line), when its inputs were this run's: the precompiler and the seed files by content, the switches
+# that change what they compile to, and the display adapters with their drivers (the store is the GPU's and the
+# driver's: static-v1\driver-v1\<device>). And only while this GPU and driver have a store (--status), which
+# holds what those shards made.
+function Get-ShardInputs([string[]]$files) {
+	$hashes = $files | Where-Object { $_ -and (Test-Path $_) } | ForEach-Object { (Get-FileHash $_).Hash }
+	# The PCI display adapters (not the remote, virtual or capture ones that come and go with a session).
+	$adapters = try {
+		Get-CimInstance Win32_VideoController | Where-Object { "$($_.PNPDeviceID)" -like 'PCI\*' } | Sort-Object PNPDeviceID |
+			ForEach-Object { "$($_.PNPDeviceID)=$($_.DriverVersion)" }
+	} catch { 'adapters unknown' }
+	$switches = "KYTY_PORTABLE_SHADERS=$env:KYTY_PORTABLE_SHADERS KYTY_ROBUST_BUFFERS=$env:KYTY_ROBUST_BUFFERS"
+	((@($hashes) + @($adapters) + $switches) -join ' ')
+}
+# Whether this GPU and driver have a store (precompiler --status): 'yes', 'no' (stale), or 'unknown' when the
+# probe itself failed (no device, a crash), which must not discard the list.
+function Get-StoreOfThisDevice {
+	$out = Join-Path ([IO.Path]::GetTempPath()) "kyty-precompile-status-$PID"
+	try {
+		$probe = Start-Process -FilePath $Exe -ArgumentList @('--game', "`"$Game`"", '--seeds', "`"$Seeds`"", '--status') `
+			-WorkingDirectory $toolDirectory -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$out.out" -RedirectStandardError "$out.err"
+		$status = @(Get-Content "$out.out" -ErrorAction SilentlyContinue)
+		if ($probe.ExitCode -ne 0 -or !($status -match '^static cache ')) { return 'unknown' }
+		if ($status -match '^static cache (current|outdated)') { 'yes' } else { 'no' }
+	} catch {
+		'unknown'
+	} finally {
+		Remove-Item "$out.out", "$out.err" -ErrorAction SilentlyContinue
+	}
+}
+function Read-DoneShards([string]$file, [string]$inputs) {
+	$set = [Collections.Generic.HashSet[string]]::new()
+	if (Test-Path $file) {
+		$lines = @(Get-Content $file)
+		$store = if ($lines.Count -and $lines[0] -eq $inputs) { Get-StoreOfThisDevice } else { 'no' }
+		if ($store -eq 'yes') {
+			foreach ($line in $lines | Select-Object -Skip 1) { [void]$set.Add($line) }
+		} elseif ($store -eq 'no') {
+			Remove-Item $file
+		} else {
+			Write-Host 'precompile: could not tell whether this GPU has a store; the finished-shards list is kept but not used'
+		}
+	}
+	return , $set
+}
+function Add-DoneShard([string]$file, [string]$inputs, [string]$name) {
+	if (!(Test-Path $file)) { New-Item -ItemType Directory -Force (Split-Path $file) | Out-Null; Set-Content $file $inputs }
+	Add-Content $file $name
+}
 # The pipeline recipes of a seed file (its body after the identity line and checksum: the records, each its word
 # count and words, then the recipes' count).
 function Get-SeedPipelines([string]$file) {
@@ -226,8 +327,8 @@ $logName = $logs.Substring($PSScriptRoot.Length + 1)
 New-Item -ItemType Directory -Force $logs | Out-Null
 $begin = Get-Date
 
-# Reduced power for a precompile process (Windows EcoQoS: every thread of it, the driver's too, at lower clocks).
-if (!('Kyty.ProcessPower' -as [type])) {
+# Opt-in Windows execution-speed throttling for a precompile process.
+if ($plan.Efficient -and !('Kyty.ProcessPower' -as [type])) {
 	Add-Type -Namespace Kyty -Name ProcessPower -MemberDefinition @'
 [StructLayout(LayoutKind.Sequential)]
 public struct PowerThrottlingState { public uint Version; public uint ControlMask; public uint StateMask; }
@@ -248,10 +349,10 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
-	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+	$process.PriorityClass = if ($Background) { [System.Diagnostics.ProcessPriorityClass]::Idle } else { [System.Diagnostics.ProcessPriorityClass]::BelowNormal }
 	if ($plan.Efficient -and ![Kyty.ProcessPower]::Throttle($process.Handle) -and $script:reducedPower -ne 'unavailable') {
 		$script:reducedPower = 'unavailable'
-		Write-Host 'precompile: this Windows has no reduced-power mode (EcoQoS); the processes run at full power'
+		Write-Host 'precompile: Windows did not enable EcoQoS; continuing with its default power policy'
 	}
 	$process.ProcessorAffinity = [IntPtr]$mask
 	$null = $process.Handle # keeps the exit code readable after the process ends
@@ -264,7 +365,7 @@ function Wait-Precompile($process, [string]$what) {
 	if ($process.ExitCode -ne 0) { throw "$what failed; logs: $logName" }
 }
 
-Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time of $Threads threads, affinity 0x$('{0:X}' -f $mask), $(if ($plan.Efficient) { 'reduced power (-FullSpeed: every CPU at full power)' } else { 'full power' }); logs $logName"
+Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time of $Threads threads, affinity 0x$('{0:X}' -f $mask), $(if ($plan.Efficient) { 'EcoQoS power saving (-FullSpeed disables it)' } else { 'EcoQoS off' }); logs $logName"
 try {
 if ($Coverage) {
 	$out = [IO.Path]::ChangeExtension($Seeds, '.compiled.shaders')
@@ -281,15 +382,53 @@ if ($InputsOnly) {
 	Write-Host "inputs saved beneath $CacheRoot (producer and integrity checked on load)"
 	return
 }
-# The shards an interrupted run finished first: what they hold is not compiled again.
-Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
-$pending = [System.Collections.Generic.Queue[object]]::new()
-$count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
-for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
-if ($ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)) {
+# The shards an interrupted run finished first: what they hold is not compiled again. Not in the background:
+# the game has the store open.
+if (!$Background) {
+	# A shard ended while saving (a background run when the game closed) leaves a temporary file no merge reads.
+	Remove-Item "$CacheRoot\static-v1\driver-v1\*\$gameId.*.shard*.tmp.*" -ErrorAction SilentlyContinue
+	Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
+}
+# Whether the game the background run works next to still runs.
+function Test-WatchedProcess { return !$WhileProcess -or [bool](Get-Process -Id $WhileProcess -ErrorAction SilentlyContinue) }
+$pending = [System.Collections.Generic.LinkedList[object]]::new()
+# A shard's name (its logs, its NVIDIA cache, the finished-shards list): contiguous slices (b) and every n-th
+# hold different items under the same i/n.
+function Get-ShardName([string]$seedFile, [string]$shard, [bool]$blocks) {
+	'shard' + ($shard -replace '/', 'of') + $(if ($blocks) { 'b' } else { '' }) + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
+}
+# What recorded play uses first (exactly the pipelines the game asks for: a fifth of the work), then every
+# shader of the game as the seeds guess it: a run stopped part way has the ones that matter most.
+$recordedShards = $ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)
+# The precompiler names a shard's file after its seed file's stem and i/n only: two tiers must not share a stem.
+if ($recordedShards -and [IO.Path]::GetFileNameWithoutExtension($Recorded) -eq [IO.Path]::GetFileNameWithoutExtension($Seeds)) {
+	throw "the recorded seed file must not be named like the seed file ($([IO.Path]::GetFileName($Recorded)))"
+}
+$doneFile = Join-Path $CacheRoot "static-v1\$gameId.done"
+$doneInputs = Get-ShardInputs @($Exe, $Seeds, $(if ($recordedShards) { $Recorded }))
+$done = if ($ShardLimit -le 0) { Read-DoneShards $doneFile $doneInputs } else { [Collections.Generic.HashSet[string]]::new() }
+$skipped = 0
+$queue = @()
+if ($recordedShards) {
 	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
+	# Contiguous slices (--shard-blocks): a recorded file ranked by use has what play needs first in its
+	# first shards, which a run stopped early (-Minutes) then holds.
 	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
-	for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Recorded, "$i/$count")) }
+	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Recorded, "$i/$count", $true) }
+} elseif ($RecordedOnly -and $ShardLimit -le 0) {
+	Write-Host 'precompile: no recorded play or hints for this game version: every shader instead (-RecordedOnly ignored)'
+}
+if (!$RecordedOnly -or !$recordedShards) {
+	$count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
+	for ($i = 0; $i -lt $count; $i++) { $queue += , @($Seeds, "$i/$Shards", $false) }
+}
+foreach ($entry in $queue) {
+	if ($done.Contains((Get-ShardName $entry[0] $entry[1] $entry[2]))) { $skipped++ } else { [void]$pending.AddLast($entry) }
+}
+if ($skipped) { Write-Host "precompile: $skipped shards an earlier run finished are kept, not run again" }
+if ($MergeOnly -and $pending.Count) {
+	Write-Host "precompile: finished shards merged; $($pending.Count) shards are left for a later run"
+	return
 }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
@@ -298,28 +437,66 @@ $running = @{}
 $finished = 0
 $split = 0
 $shown = Get-Date
-while ($pending.Count -or $running.Count) {
-	while ($pending.Count -and $running.Count -lt $Jobs) {
-		$seedFile, $shard = $pending.Dequeue()
-		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
-		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")))
+# The budget counts from the first shard: making seeds and hints and merging an earlier run's shards come first.
+$deadline = if ($Minutes -gt 0) { (Get-Date).AddMinutes($Minutes) } else { [datetime]::MaxValue }
+$budgetStopped = $false
+$gameEnded = $false
+while (($pending.Count -and !$budgetStopped) -or $running.Count) {
+	if (!(Test-WatchedProcess)) {
+		# The game ended: so does the background run (the shard in progress starts again next time).
+		$gameEnded = $true
+		foreach ($name in @($running.Keys)) {
+			$process = $running[$name][2]
+			if (!$process.HasExited) {
+				$process.Kill()
+				$process.WaitForExit()
+			} elseif ($process.ExitCode -eq 0) {
+				# Finished just now: listed like the others.
+				$finished++
+				Add-DoneShard $doneFile $doneInputs $name
+			}
+		}
+		$running.Clear()
+		break
+	}
+	while ($pending.Count -and $running.Count -lt $Jobs -and !$budgetStopped) {
+		if ((Get-Date) -ge $deadline) {
+			$budgetStopped = $true
+			Write-Host ("precompile: the {0}-minute budget is used; {1} running shards finish, {2} wait for a later run" -f $Minutes,
+				$running.Count, $pending.Count)
+			break
+		}
+		$seedFile, $shard, $blocks = $pending.First.Value
+		$pending.RemoveFirst()
+		$name = Get-ShardName $seedFile $shard $blocks
+		$arguments = @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")
+		if ($blocks) { $arguments += '--shard-blocks' }
+		$running[$name] = @($seedFile, $shard, (Start-Precompile $name $arguments), $blocks)
 	}
 	Start-Sleep -Milliseconds 250
 	foreach ($name in @($running.Keys)) {
-		$seedFile, $shard, $process = $running[$name]
+		$seedFile, $shard, $process, $blocks = $running[$name]
 		if (!$process.HasExited) { continue }
 		$running.Remove($name)
 		Remove-NvidiaCache $process
 		if ($process.ExitCode -eq 3) {
 			$i, $n = [int[]]($shard -split '/')
 			if ($n -ge 65536) { throw "$name cannot be split further; logs: $logName" }
-			$pending.Enqueue(@($seedFile, "$i/$(2 * $n)"))
-			$pending.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
+			# Resolve smaller retries before expanding all remaining parents. A FIFO
+			# frontier can grow for hours without reaching a completed or terminal child.
+			# Both halves remain scheduled (every n-th: i and i + n of 2n; contiguous slices: 2i and
+			# 2i + 1); partial shard data stays available. Halves an earlier run finished are kept
+			# (a shard that splits splits again).
+			$halves = if ($blocks) { "$(2 * $i + 1)/$(2 * $n)", "$(2 * $i)/$(2 * $n)" } else { "$($i + $n)/$(2 * $n)", "$i/$(2 * $n)" }
+			foreach ($half in $halves) {
+				if ($done.Contains((Get-ShardName $seedFile $half $blocks))) { $skipped++ } else { [void]$pending.AddFirst(@($seedFile, $half, $blocks)) }
+			}
 			$split++
 		} elseif ($process.ExitCode -ne 0) {
 			throw "$name failed; logs: $logName"
 		} else {
 			$finished++
+			if ($ShardLimit -le 0) { Add-DoneShard $doneFile $doneInputs $name }
 		}
 	}
 	if (((Get-Date) - $shown).TotalSeconds -ge 60) {
@@ -329,11 +506,33 @@ while ($pending.Count -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
+if ($Background) {
+	Write-Host ("precompile: {0} shards finished in the background in {1:hh\:mm\:ss}, {2} left{3}; merged before the next start" -f
+		$finished, ((Get-Date) - $begin), $pending.Count, $(if ($gameEnded) { ' (the game ended)' } else { '' }))
+	return
+}
 if ($ShardLimit -gt 0) {
 	Write-Host ("{0} of {1} shards done in {2:hh\:mm\:ss} ({3} split); not merged (-ShardLimit)" -f $finished, $Shards, ((Get-Date) - $begin), $split)
 	return
 }
-Wait-Precompile (Start-Precompile 'merge' @('--merge', '--prune')) 'merge'
+# -RecordedOnly and a used -Minutes budget keep what an earlier run made (--prune would keep only this run's),
+# and mark the cache as partial: the store is newer than the seeds, so --status calls it current, and
+# run-windows.ps1 -Prompt would stop offering the full run. A full run removes the mark. A run that kept
+# shards an earlier one finished does not prune either: their pipelines are in no shard file of this run (so
+# pipelines that no seed makes any more stay until a full run that starts from no finished shards).
+$partialRun = ($RecordedOnly -and $recordedShards) -or $budgetStopped
+$mergeArguments = if ($partialRun -or $skipped) { @('--merge') } else { @('--merge', '--prune') }
+$partial = Join-Path $CacheRoot "static-v1\$gameId.partial"
+Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
+if ($partialRun) {
+	New-Item -ItemType Directory -Force (Split-Path $partial) | Out-Null
+	$why = @()
+	if ($RecordedOnly -and $recordedShards) { $why += 'only what recorded play uses (-RecordedOnly)' }
+	if ($budgetStopped) { $why += "the $Minutes-minute budget ended the run (-Minutes)" }
+	Set-Content $partial "precompile-windows.ps1: $($why -join '; '); a full run removes this"
+} else {
+	Remove-Item $partial, $doneFile -ErrorAction SilentlyContinue
+}
 Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs'
 $cache = Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\$gameId.bin", "$CacheRoot\static-v1\driver-v1\*\$gameId.binaries" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1

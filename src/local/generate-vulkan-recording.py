@@ -59,8 +59,15 @@ def generate(registry, header):
                       # Likewise a free: a set is freed only once the GPU passed the tick
                       # it retired at, so no unreplayed packet names it (once a frame).
                       'vkFreeDescriptorSets',
-                      # New objects no queued packet can reference.
-                      'vkCreateDescriptorSetLayout', 'vkCreateSampler'}
+                      # New objects no queued packet can reference. A new shader's module and a
+                      # new pipeline's layout are made while queued binds may still wait for
+                      # other pipelines' builds: a drain there would wait for those.
+                      'vkCreateDescriptorSetLayout', 'vkCreateSampler', 'vkCreatePipelineLayout',
+                      'vkCreateShaderModule',
+                      # Pipeline binaries are only ever inputs of a pipeline's creation; no command
+                      # names one. The store makes a shared one under its lock, which a pipeline
+                      # build on a worker that queued binds wait for may need too.
+                      'vkCreatePipelineBinariesKHR', 'vkDestroyPipelineBinaryKHR'}
     # Live `tracem`: a GPU timestamp after each emulator-side work command (LiveTrace::VulkanMark);
     # the ids are the tags tools/local/live-trace.py marks prints by name.
     MARK_IDS = {'vkCmdDispatch': 1, 'vkCmdDispatchIndirect': 2, 'vkCmdDispatchBase': 3,
@@ -148,7 +155,7 @@ def generate(registry, header):
         # accesses a command pool nor executes commands still being recorded.
         # Preserve the real query; do not wait for our CPU recording queue.
         if name not in NO_DRAIN_CALLS:
-            declarations.append('    BeforeDirect();')
+            declarations.append(f'    BeforeDirect("{name}");')
         if mark:
             declarations.append(f'    original.{name}({", ".join(pnames)});')
             declarations.append(f'    {mark}')

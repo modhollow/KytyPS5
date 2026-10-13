@@ -31,6 +31,10 @@ bool PacketsEnabled();
 // until replay finishes; callers never lend stack or mutable-cache pointers.
 bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
                    std::shared_ptr<const void> owner = {});
+// A packet that only changes bound state, as a recorded vkCmdBindPipeline does: no work, and the
+// worker's raw-state reuse starts over before it replays (draw packets bind again).
+bool EnqueueStatePacket(ReplayPacket replay, std::span<const Segment> segments,
+                        std::shared_ptr<const void> owner = {});
 // Preserve order when a packet cannot fit. Does not retain any argument.
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments);
 // Command-buffer begin/end and queue submission, queued in order with the recorded

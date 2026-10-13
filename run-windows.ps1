@@ -51,6 +51,9 @@ param(
 	[int]$FrameGen = 0,
 	[string]$Affinity = '',
 	[switch]$Prompt,
+	# A partial precompile (-RecordedOnly, -Minutes) goes on in the background while the game runs: one idle process
+	# (precompile-windows.ps1 -Background); what it finishes is merged before the next start.
+	[switch]$BackgroundPrecompile,
 	[switch]$Follow,
 	[switch]$DryRun,
     [string]$CacheRoot = ''
@@ -449,9 +452,11 @@ if ($shaders) {
 	# behind after a merge).
 	# Outdated: made from the seeds of an older precompile program, which listed fewer of the game's shaders.
 	$cacheOutdated = $status -match 'static cache outdated'
-	$cacheReady = $status -match 'static cache current' -and
+	# precompile-windows.ps1 -RecordedOnly: what recorded play uses, not every shader.
+	$cachePartial = $param -and (Test-Path "$CacheRoot\static-v1\$($titleId)_$($param.contentVersion).partial")
+	$cacheReady = !$cachePartial -and $status -match 'static cache current' -and
 		!(Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\*.shard*" -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 1MB -and $_.Name -notmatch '\.tmp(?:\.|$)' })
-	Write-Host "shaders:  prefetch inputs (producer/integrity checked) $(if ($inputsReady) { 'ready' } else { 'to be made' }), static pipeline cache $(if ($cacheReady) { 'ready' } elseif ($cacheOutdated) { 'out of date (precompile-windows.ps1 compiles what is new)' } else { 'not made (precompile-windows.ps1)' })"
+	Write-Host "shaders:  prefetch inputs (producer/integrity checked) $(if ($inputsReady) { 'ready' } else { 'to be made' }), static pipeline cache $(if ($cacheReady) { 'ready' } elseif ($cachePartial) { 'partial (precompile-windows.ps1 compiles the rest)' } elseif ($cacheOutdated) { 'out of date (precompile-windows.ps1 compiles what is new)' } else { 'not made (precompile-windows.ps1)' })"
 }
 
 # -Prompt: the game version and the precompile, before anything starts.
@@ -461,23 +466,21 @@ if ($Prompt -and ($offer -or !$tested)) {
 	$info = "Game: $(if ($titleName) { $titleName } else { 'unknown' }) ($version)"
 	$info += if ($tested) { ', a tested version.' } else { "`n⚠ This version is untested (the emulator was tested with $($testedVersions -join ' and ')): it may not run or may fail." }
 	if ($offer) {
-		$minutes = [math]::Ceiling(55 * 22 / $cpus / 10) * 10
-		# The precompile's default plan (the cores less one, at reduced power: precompile-windows.ps1 -PlanOnly) ran
-		# 2 processes instead of 6 on a 16-thread PC and took about twice as long, about 70% of the peak CPU power
-		# (10-11): the time is scaled by (whole-CPU processes / plan's processes)^0.63.
 		$plan = try { & "$PSScriptRoot\precompile-windows.ps1" -PlanOnly -Affinity $mask | ConvertFrom-Json } catch { $null }
-		if ($plan -and $plan.Efficient) {
-			$fullJobs = [math]::Max(1, [math]::Ceiling($cpus / 3))
-			$minutes = [math]::Ceiling($minutes * [math]::Pow($fullJobs / [math]::Max(1, $plan.Jobs), 0.63) / 10) * 10
-		}
-		$load = if ($plan -and $plan.Efficient) { 'at reduced CPU load to keep it cooler (precompile-windows.ps1 -FullSpeed: the whole CPU, about twice as fast and hotter)' } else { 'with the CPU fully loaded' }
-		$time = if ($minutes -lt 90) { "about $minutes minutes" } else { 'about {0:N1} hours' -f ($minutes / 60) }
-		$message = if ($cacheOutdated) {
+		$load = if ($plan -and $plan.Budget -lt $cpus) {
+			'using a limited CPU worker budget (precompile-windows.ps1 -FullSpeed uses all allowed CPUs)'
+		} else { 'using the allowed CPUs' }
+		if ($plan -and $plan.Efficient) { $load += ', with power saving enabled' }
+		$time = 'may take hours, depending on the hardware, driver and shaders'
+		$message = if ($cachePartial) {
+			"$info`n`nOnly part of the shaders is precompiled for this graphics card (what recorded play uses, or what a time budget allowed): the rest stutter the first time they appear in the game.`n" +
+				"Precompiling the rest $time ($load; closing its window stops it, and the next run continues)."
+		} elseif ($cacheOutdated) {
 			"$info`n`nThis version of the emulator precompiles more of the game's shaders than the one that made the precompiled shaders on this PC: the new ones would stutter the first time they appear.`n" +
-				"Precompiling again compiles only what is new (minutes; at most $time on this PC, $load; closing its window stops it, and the next run continues)."
+				"Precompiling again compiles only what is new; this $time ($load; closing its window stops it, and the next run continues)."
 		} else {
 			"$info`n`nThe shaders are not precompiled for this graphics card yet: scenes and effects stutter the first time they appear in the game (a fraction of a second to a few seconds).`n" +
-				"The precompile compiles every shader of the game once: $time on this PC ($load; closing its window stops it, and the next run continues). " +
+				"The precompile compiles every shader of the game once and $time ($load; closing its window stops it, and the next run continues). " +
 				"It is needed only once, and again after a graphics driver update."
 		}
 		$choice, $never = Show-Choice $message @('Precompile first, then start the game', 'Start the game now', 'Quit') "Don't ask about precompiling again"
@@ -485,7 +488,8 @@ if ($Prompt -and ($offer -or !$tested)) {
 		if ($choice -ne 0 -and $choice -ne 1) { Write-Host 'cancelled'; return }
 		if ($choice -eq 0) {
 			try {
-				& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask
+				# The launch's precompile program, seed file and caches (the finished-shards list is keyed to them).
+				& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask -Exe $tool -Seeds $seeds -CacheRoot $CacheRoot
 				$inputsReady = $true # the full run ends with them
 			} catch {
 				Write-Host "precompile failed ($($_.Exception.Message)); starting the game anyway"
@@ -527,6 +531,25 @@ if ($memory -and $Prompt) {
 	if ($choice -ne 0) { Write-Host 'cancelled'; return }
 }
 
+# Shards a background or interrupted precompile finished: into the store before the game opens it (and, when
+# they are all there, the precompile is complete).
+# (This game's; small ones stay behind after a merge.)
+$waiting = $shaders -and $param -and (Get-ChildItem "$CacheRoot\static-v1\driver-v1\*\$($titleId)_$($param.contentVersion).*.shard*" -ErrorAction SilentlyContinue |
+	Where-Object { $_.Length -gt 1MB -and $_.Name -notmatch '\.tmp(?:\.|$)' })
+if ($waiting -and !$DryRun) {
+	Write-Host 'shaders:  merging the shards an earlier precompile finished'
+	try {
+		& "$PSScriptRoot\precompile-windows.ps1" -Game $Game -Affinity $mask -Exe $tool -Seeds $seeds -CacheRoot $CacheRoot -MergeOnly
+		# Complete when the merge finished the precompile: no partial mark and no finished-shards list (a complete
+		# run removes both; an interrupted full run keeps its list), and then it made the inputs too.
+		$cacheStem = "$CacheRoot\static-v1\$($titleId)_$($param.contentVersion)"
+		$cachePartial = Test-Path "$cacheStem.partial"
+		$inputsReady = $inputsReady -or (!$cachePartial -and !(Test-Path "$cacheStem.done"))
+	} catch {
+		Write-Host "shaders:  merging failed ($($_.Exception.Message)); they are merged by the next precompile"
+	}
+}
+
 if ($shaders -and !$inputsReady) {
 	Write-Host 'shaders:  making the background shader preparation inputs for this graphics card (first run or after a driver update: about a minute)'
 	if ((Invoke-Tool @('--no-pipelines', '--static-inputs', '--threads', "$cpus")) -ne 0) {
@@ -542,6 +565,24 @@ $process = Start-Process -FilePath $Exe -ArgumentList $quoted -WorkingDirectory 
 if ($mask -ne $all) { $process.ProcessorAffinity = [IntPtr]$mask }
 $null = $process.Handle # keeps the exit code readable after the process ends
 Write-Host "pid $($process.Id); logs: $($logDir.Substring($PSScriptRoot.Length + 1))\$stamp.*.log"
+# The background run takes up to about 1.5 GB more on top of the game's 34 GB.
+if ($BackgroundPrecompile -and $shaders -and $cachePartial -and $commit -lt 36GB) {
+	Write-Host 'shaders:  no background precompile: Windows has too little memory left for it next to the game'
+} elseif ($BackgroundPrecompile -and $shaders -and $cachePartial) {
+	# Without the game's switches (as the precompile before the game runs: the finished-shards list is keyed to them).
+	$saved = @{}
+	foreach ($key in @($environment.Keys)) { $saved[$key] = [Environment]::GetEnvironmentVariable($key); Remove-Item "env:$key" -ErrorAction SilentlyContinue }
+	try {
+		$shell = (Get-Process -Id $PID).Path
+		$background = Start-Process -FilePath $shell -WindowStyle Hidden -PassThru -RedirectStandardOutput "$logDir\$stamp.precompile.log" `
+			-RedirectStandardError "$logDir\$stamp.precompile.err.log" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+			"`"$PSScriptRoot\precompile-windows.ps1`"", '-Game', "`"$Game`"", '-Affinity', "$mask", '-Exe', "`"$tool`"", '-Seeds', "`"$seeds`"",
+			'-CacheRoot', "`"$CacheRoot`"", '-Background', '-WhileProcess', "$($process.Id)")
+		Write-Host "shaders:  precompiling the rest in the background (pid $($background.Id); log $stamp.precompile.log)"
+	} finally {
+		foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
+	}
+}
 if (!$Precompile -and $Follow) {
 	# The run log in this window as it is written; the exit code (and the error log's end) when the game ends.
 	$reader = $null

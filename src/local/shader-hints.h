@@ -24,10 +24,13 @@ std::string GameId(const std::filesystem::path& game);
 
 // --make-hints: the hint file of the game version game_id from recordings (warmup files or recorded
 // seed files): their records whose code the seed file has (what --make-seeds lists on every PC; a
-// recording can hold another version's play too) and the pipeline recipes of those. 0, or 1
-// (nothing is written).
+// recording can hold another version's play too) and the pipeline recipes of those. Ranked by use:
+// what more of the recordings and of the `rank` recordings (--rank: they order the hints, but add
+// none) use comes first, then what a recording used earlier, so that a precompile stopped part way
+// (-Minutes) has what play needs first. 0, or 1 (nothing is written).
 int Make(const std::filesystem::path& out, const std::filesystem::path& seeds,
-         const std::vector<std::filesystem::path>& recordings, const std::string& game_id);
+         const std::vector<std::filesystem::path>& recordings,
+         const std::vector<std::filesystem::path>& rank, const std::string& game_id);
 
 // --apply-hints: the recorded seed file of a hint file of the game version game_id, each record
 // with the code of the seed file's program of that word count and hash (a record without one is

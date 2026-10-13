@@ -56,28 +56,31 @@ Trace::Mode ModeOf(Build build) {
 }
 
 template <typename Input, typename Build>
-Trace::Context ComputeContext(const Input& input, Build build, bool cache_control) {
+Trace::Context ComputeContext(const Input& input, Build build, bool cache_control,
+                              uint32_t api_version = 0) {
 	Trace::Context context;
-	context.mode          = ModeOf(build);
-	context.cache_control = cache_control;
-	context.shader_count  = 1;
-	context.shaders[0]    = {VK_SHADER_STAGE_COMPUTE_BIT,
-	                         input.stage.program != nullptr ? input.stage.program->shader_hash : 0,
-	                         input.stage.program != nullptr};
+	context.mode                 = ModeOf(build);
+	context.cache_control        = cache_control;
+	context.feedback_api_version = api_version;
+	context.shader_count         = 1;
+	context.shaders[0] = {VK_SHADER_STAGE_COMPUTE_BIT,
+	                      input.stage.program != nullptr ? input.stage.program->shader_hash : 0,
+	                      input.stage.program != nullptr};
 	return context;
 }
 template <typename Vertex, typename Pixel, typename Build>
 Trace::Context GraphicsContext(const Vertex& vertex, const Pixel* pixel, Build build,
-                               bool cache_control) {
+                               bool cache_control, uint32_t api_version = 0) {
 	Trace::Context context;
-	context.mode          = ModeOf(build);
-	context.cache_control = cache_control;
-	context.shader_count  = pixel != nullptr ? 2 : 1;
-	const auto* vs        = vertex.stage.program;
-	context.shaders[0]    = {static_cast<uint32_t>(vs != nullptr && vs->stage == ShaderType::Mesh
-	                                                   ? VK_SHADER_STAGE_MESH_BIT_EXT
-	                                                   : VK_SHADER_STAGE_VERTEX_BIT),
-	                         vs != nullptr ? vs->shader_hash : 0, vs != nullptr};
+	context.mode                 = ModeOf(build);
+	context.cache_control        = cache_control;
+	context.feedback_api_version = api_version;
+	context.shader_count         = pixel != nullptr ? 2 : 1;
+	const auto* vs               = vertex.stage.program;
+	context.shaders[0] = {static_cast<uint32_t>(vs != nullptr && vs->stage == ShaderType::Mesh
+	                                                ? VK_SHADER_STAGE_MESH_BIT_EXT
+	                                                : VK_SHADER_STAGE_VERTEX_BIT),
+	                      vs != nullptr ? vs->shader_hash : 0, vs != nullptr};
 	if (pixel != nullptr) {
 		const auto* ps     = pixel->stage.program;
 		context.shaders[1] = {VK_SHADER_STAGE_FRAGMENT_BIT, ps != nullptr ? ps->shader_hash : 0,
@@ -170,7 +173,9 @@ private:
 		    "guest-stages=%u stage0=0x%x hash0=%016llx known0=%u stage1=0x%x hash1=%016llx "
 		    "known1=%u "
 		    "op=%s cache=%u flags=%016llx flags-known=%u result-kind=%u result=%d "
-		    "wall-ns=%llu wall-known=%u thread-cpu-ns=%llu cpu-known=%u cpu-source=%s\n",
+		    "wall-ns=%llu wall-known=%u thread-cpu-ns=%llu cpu-known=%u cpu-source=%s "
+		    "feedback-api=%u feedback-requested=%u feedback-valid=%u feedback-flags=0x%x "
+		    "driver-duration-ns=%llu app-cache-hit=%u app-cache-hit-known=%u\n",
 		    static_cast<unsigned long long>(context.invocation), context.thread,
 		    static_cast<unsigned>(context.caller), static_cast<unsigned>(context.driver_cache),
 		    static_cast<unsigned>(context.mode), context.cache_control ? 1u : 0u,
@@ -184,7 +189,11 @@ private:
 		    record.result, static_cast<unsigned long long>(record.wall_ns),
 		    record.wall_available ? 1u : 0u, static_cast<unsigned long long>(record.thread_cpu_ns),
 		    record.thread_cpu_available ? 1u : 0u,
-		    record.thread_cpu_available ? "os-thread-time" : "unavailable");
+		    record.thread_cpu_available ? "os-thread-time" : "unavailable",
+		    context.feedback_api_version, record.feedback_requested ? 1u : 0u,
+		    record.feedback_available ? 1u : 0u, record.feedback_flags,
+		    static_cast<unsigned long long>(record.driver_duration_ns),
+		    record.application_cache_hit ? 1u : 0u, record.feedback_available ? 1u : 0u);
 	}
 	Trace::Observer observer_ {};
 	bool            engaged_ = false;

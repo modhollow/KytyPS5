@@ -30,6 +30,14 @@ void Packet(std::span<const LocalVulkanRecording::Segment> segments,
     packet_epoch = epoch;
     dispatch.vkCmdDraw(nullptr, 3, 1, item.sequence, 7);
 }
+std::atomic<uint32_t> state_replays {0};
+uint64_t state_seen_draws = 0;
+void StatePacket(std::span<const LocalVulkanRecording::Segment> segments,
+                 const vk::detail::DispatchLoaderDynamic&) {
+    Check(segments.size() == 1 && segments[0].size == sizeof(PacketData));
+    state_seen_draws = draws.load();
+    state_replays.fetch_add(1);
+}
 VKAPI_ATTR void VKAPI_CALL LineWidth(VkCommandBuffer, float value) { Check(value == 1.0f); }
 
 VKAPI_ATTR void VKAPI_CALL Draw(VkCommandBuffer, uint32_t vertices, uint32_t instances,
@@ -190,6 +198,30 @@ int main() {
         Check(!LocalVulkanRecording::EnqueuePacket(Packet, large));
         const LocalVulkanRecording::Segment invalid[] {{nullptr, 1}};
         Check(!LocalVulkanRecording::EnqueuePacket(Packet, invalid));
+
+        // A state packet (a pipeline bind that waits for its build) keeps its owner until it
+        // replays, stays in order, and starts the raw-state reuse over as a recorded bind does.
+        stalled.store(false);
+        release.store(false);
+        for (uint32_t i = 20135; i < 20263; ++i)
+            api.vkCmdDraw(nullptr, 3, i == 20135 ? 999 : 1, i, 7);
+        while (!stalled.load()) std::this_thread::yield();
+        item.sequence = 20263;
+        item.same_epoch = false;
+        Check(LocalVulkanRecording::EnqueuePacket(Packet, data));
+        auto state_owner = std::make_shared<int>(0);
+        std::weak_ptr<const void> state_weak = state_owner;
+        const LocalVulkanRecording::Segment state[] {{&item, sizeof(item)}};
+        Check(LocalVulkanRecording::EnqueueStatePacket(StatePacket, state, state_owner));
+        state_owner.reset();
+        Check(!state_weak.expired());
+        ++item.sequence;
+        item.same_epoch = false;
+        Check(LocalVulkanRecording::EnqueuePacket(Packet, data));
+        release.store(true);
+        Check(api.vkEndCommandBuffer(nullptr) == VK_SUCCESS);
+        Check(state_weak.expired() && state_replays.load() == 1 && state_seen_draws == 20264);
+        Check(draws.load() == 20265);
     }
     std::puts("Vulkan recording: raw/packet ordering, pointer/plan ownership, state invalidation, ring reuse, query and fallback passed");
 }

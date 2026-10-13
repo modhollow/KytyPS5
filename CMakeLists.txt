@@ -157,6 +157,7 @@ file(GLOB_RECURSE KYTY_STATIC_RECOMPILER_INPUTS CONFIGURE_DEPENDS
     "${KYTY_SOURCE_DIR}/graphics/shader/*.inc")
 set(KYTY_STATIC_PRODUCER_INPUTS
     "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/staticPrecompile.inc"
+    "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/precompileSchedule.h"
     "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.h"
     "${KYTY_SOURCE_DIR}/graphics/presentation/window/vulkanWindow.cpp"
     "${KYTY_SOURCE_DIR}/graphics/shader/shaderCompiler.h"
@@ -172,7 +173,11 @@ list(REMOVE_DUPLICATES KYTY_STATIC_PRODUCER_INPUTS)
 list(SORT KYTY_STATIC_PRODUCER_INPUTS)
 set(KYTY_STATIC_PRODUCER_CONTENTS "static-input-producer-v1\n")
 foreach(KYTY_STATIC_INPUT IN LISTS KYTY_STATIC_PRODUCER_INPUTS)
-    file(SHA256 "${KYTY_STATIC_INPUT}" KYTY_STATIC_INPUT_HASH)
+    # Git checkout policy can leave identical source as LF or CRLF, including
+    # existing checkouts. Keep the canonical LF identity without retagging data.
+    file(READ "${KYTY_STATIC_INPUT}" KYTY_STATIC_INPUT_CONTENTS)
+    string(REPLACE "\r\n" "\n" KYTY_STATIC_INPUT_CONTENTS "${KYTY_STATIC_INPUT_CONTENTS}")
+    string(SHA256 KYTY_STATIC_INPUT_HASH "${KYTY_STATIC_INPUT_CONTENTS}")
     file(RELATIVE_PATH KYTY_STATIC_INPUT_NAME "${KYTY_SOURCE_DIR}" "${KYTY_STATIC_INPUT}")
     string(APPEND KYTY_STATIC_PRODUCER_CONTENTS "${KYTY_STATIC_INPUT_NAME}:${KYTY_STATIC_INPUT_HASH}\n")
 endforeach()
@@ -601,6 +606,10 @@ else()
     target_link_options(static_cache_readiness_tests PRIVATE -Wl,--gc-sections)
 endif()
 
+add_executable(precompile_schedule_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/PrecompileScheduleTests.cpp")
+target_include_directories(precompile_schedule_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(pipeline_capture_contract_tests EXCLUDE_FROM_ALL
     "${KYTY_TESTS_DIR}/PipelineCaptureContractTests.cpp")
 target_link_libraries(pipeline_capture_contract_tests PRIVATE Vulkan::Headers)
@@ -623,6 +632,11 @@ target_include_directories(compile_thread_power_tests PRIVATE "${KYTY_SOURCE_DIR
 if(WIN32)
 	target_link_libraries(compile_thread_power_tests PRIVATE dxgi)
 endif()
+
+add_executable(pipeline_late_build_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineLateBuildTests.cpp")
+target_link_libraries(pipeline_late_build_tests PRIVATE Threads::Threads)
+target_include_directories(pipeline_late_build_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
 # Paths past MAX_PATH are a Windows matter.
 if(WIN32)
@@ -782,6 +796,14 @@ endif()
 
 if(BUILD_TESTING)
 	find_package(Threads REQUIRED)
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	find_package(Git REQUIRED)
+	add_test(NAME static_input_producer
+		COMMAND "${Python3_EXECUTABLE}" "${KYTY_TESTS_DIR}/StaticInputProducerTests.py"
+			--source "${CMAKE_CURRENT_SOURCE_DIR}"
+			--scratch-root "${CMAKE_CURRENT_BINARY_DIR}/static-producer-tests"
+			--cmake "${CMAKE_COMMAND}" --git "${GIT_EXECUTABLE}")
+	set_tests_properties(static_input_producer PROPERTIES TIMEOUT 120)
 	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
@@ -798,11 +820,15 @@ if(BUILD_TESTING)
 	add_test(NAME cache_upgrade_compatibility COMMAND $<TARGET_FILE:pipeline_cache_upgrade_tests>)
 	add_test(NAME cache_native_read COMMAND $<TARGET_FILE:pipeline_cache_native_read_tests>)
 	add_test(NAME static_cache_readiness COMMAND $<TARGET_FILE:static_cache_readiness_tests>)
+	add_test(NAME precompile_schedule COMMAND $<TARGET_FILE:precompile_schedule_tests>)
+	set_tests_properties(precompile_schedule PROPERTIES TIMEOUT 15)
 	add_test(NAME pipeline_capture_contract COMMAND $<TARGET_FILE:pipeline_capture_contract_tests>)
 	add_test(NAME pipeline_build_attempts COMMAND $<TARGET_FILE:pipeline_build_attempt_tests>)
 	set_tests_properties(pipeline_build_attempts PROPERTIES TIMEOUT 15)
 	add_test(NAME compile_thread_power COMMAND $<TARGET_FILE:compile_thread_power_tests>)
 	set_tests_properties(compile_thread_power PROPERTIES TIMEOUT 15)
+	add_test(NAME pipeline_late_build COMMAND $<TARGET_FILE:pipeline_late_build_tests>)
+	set_tests_properties(pipeline_late_build PROPERTIES TIMEOUT 15)
 	if(WIN32)
 		add_test(NAME pipeline_binaries_long_path COMMAND $<TARGET_FILE:pipeline_binaries_long_path_tests>)
 		set_tests_properties(pipeline_binaries_long_path PROPERTIES TIMEOUT 15)
@@ -812,6 +838,14 @@ if(BUILD_TESTING)
 			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
 			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/PrecompilePlanTests.ps1")
 			set_tests_properties(precompile_plan PROPERTIES TIMEOUT 60)
+			add_test(NAME precompile_shard_scheduler
+			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
+			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/PrecompileShardSchedulerTests.ps1")
+			set_tests_properties(precompile_shard_scheduler PROPERTIES TIMEOUT 30)
+			add_test(NAME launcher_module_path
+			         COMMAND "${KYTY_PWSH}" -NoProfile -ExecutionPolicy Bypass -File
+			                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/LauncherModulePathTests.ps1")
+			set_tests_properties(launcher_module_path PROPERTIES TIMEOUT 60)
 		endif()
 	endif()
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
@@ -901,7 +935,9 @@ if(BUILD_TESTING)
 		pipeline_cache_native_read_tests
 		static_cache_readiness_tests
 		pipeline_build_attempt_tests
+		precompile_schedule_tests
 		compile_thread_power_tests
+		pipeline_late_build_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -1025,9 +1061,13 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	endforeach()
 	add_executable(vulkan_recording_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/VulkanRecordingTests.cpp"
-		"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
+		"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}"
+		"${KYTY_SOURCE_DIR}/local/local-platform.cpp")
 	target_include_directories(vulkan_recording_tests PRIVATE ${inc_headers} "${CMAKE_CURRENT_BINARY_DIR}")
-	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers)
+	target_link_libraries(vulkan_recording_tests PRIVATE Threads::Threads Vulkan::Headers ${CMAKE_DL_LIBS})
+	if(WIN32)
+		target_link_libraries(vulkan_recording_tests PRIVATE dxgi)
+	endif()
 
 	foreach(native_resource_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests
 			resource_tracking_tests resource_materialization_tests)
