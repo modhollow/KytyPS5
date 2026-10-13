@@ -71,6 +71,7 @@ enum : uint32_t {
 	StorageClassStorageBuffer                = 12,
 	StorageClassPhysicalStorageBuffer        = 5349,
 	FunctionControlNone                      = 0,
+	FunctionControlDontInline                = 2,
 	SelectionControlNone                     = 0,
 	LoopControlNone                          = 0,
 };
@@ -409,6 +410,7 @@ struct EmitterState {
 	uint32_t bda_pagetable_variable       = 0;
 	uint32_t fault_buffer_variable        = 0;
 	uint32_t bda_pointer_function         = 0;
+	uint32_t runtime_decode_function      = 0;
 	uint32_t gds_variable                 = 0;
 	uint32_t lod_stats_variable           = 0;
 	bool     lod_stats_subgroup           = false;
@@ -843,6 +845,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineRuntimeDecode(EmitterState& state);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

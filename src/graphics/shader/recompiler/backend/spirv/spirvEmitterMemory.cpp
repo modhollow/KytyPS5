@@ -689,20 +689,20 @@ RuntimeComponent LocateRuntimeComponent(ValueEmitContext& ctx, const IR::Inst& i
 // Every conversion is computed and the format's picked: branches per component made the portable
 // module of a shader with hundreds of formatted loads tens of thousands of blocks (minutes to
 // compile), and only a first encounter runs it (the next start compiles the specialized module).
-uint32_t DecodeRuntimeComponent(EmitterState& state, const RuntimeFormat& format,
-                                const RuntimeComponent& located, uint32_t dword) {
+uint32_t EmitRuntimeDecode(EmitterState& state, uint32_t format_type, uint32_t format_signed,
+                           uint32_t located_shift, uint32_t located_bits, uint32_t dword) {
 	using Format::ComponentType;
 	// Its bits, zero- or sign-extended.
-	const auto unused = Binary(state, OpISub, TypeU32(state), ConstantU32(state, 32), located.bits);
+	const auto unused = Binary(state, OpISub, TypeU32(state), ConstantU32(state, 32), located_bits);
 	const auto shifted =
 	    Binary(state, OpShiftLeftLogical, TypeU32(state),
-	           Binary(state, OpShiftRightLogical, TypeU32(state), dword, located.shift), unused);
+	           Binary(state, OpShiftRightLogical, TypeU32(state), dword, located_shift), unused);
 	const auto sign_extended =
 	    Unary(state, OpBitcast, TypeU32(state),
 	          Binary(state, OpShiftRightArithmetic, TypeI32(state),
 	                 Unary(state, OpBitcast, TypeI32(state), shifted), unused));
 	const auto zero_extended = Binary(state, OpShiftRightLogical, TypeU32(state), shifted, unused);
-	const auto raw = Select(state, TypeU32(state), format.is_signed, sign_extended, zero_extended);
+	const auto raw = Select(state, TypeU32(state), format_signed, sign_extended, zero_extended);
 	const auto max_value = [&](uint32_t all_ones) {
 		return Unary(state, OpConvertUToF, TypeF32(state),
 		             Binary(state, OpShiftRightLogical, TypeU32(state),
@@ -727,20 +727,34 @@ uint32_t DecodeRuntimeComponent(EmitterState& state, const RuntimeFormat& format
 		return Select(state, TypeU32(state), condition, value, otherwise);
 	};
 	const auto bits_are = [&](uint32_t bits) {
-		return EmitCompareU32Constant(state, OpIEqual, located.bits, bits);
+		return EmitCompareU32Constant(state, OpIEqual, located_bits, bits);
 	};
 	auto floating = pick(bits_are(10u), EmitUFloatToF32Bits(state, raw, 10), raw);
 	floating      = pick(bits_are(11u), EmitUFloatToF32Bits(state, raw, 11), floating);
 	floating =
 	    pick(bits_are(16u), EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, raw)), floating);
 	const auto type_is = [&](ComponentType type) {
-		return EmitCompareU32Constant(state, OpIEqual, format.type, uint32_t(type));
+		return EmitCompareU32Constant(state, OpIEqual, format_type, uint32_t(type));
 	};
 	auto value = pick(type_is(ComponentType::Float), floating, raw);
 	value      = pick(type_is(ComponentType::Sscaled), sscaled, value);
 	value      = pick(type_is(ComponentType::Uscaled), uscaled, value);
 	value      = pick(type_is(ComponentType::Snorm), snorm, value);
 	return pick(type_is(ComponentType::Unorm), unorm, value);
+}
+
+// The decode above, called (DefineRuntimeDecode) where the module defines it.
+uint32_t DecodeRuntimeComponent(EmitterState& state, const RuntimeFormat& format,
+                                const RuntimeComponent& located, uint32_t dword) {
+	if (state.runtime_decode_function == 0) {
+		return EmitRuntimeDecode(state, format.type, format.is_signed, located.shift, located.bits,
+		                         dword);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpFunctionCall, TypeU32(state), result,
+	                           state.runtime_decode_function, dword, located.shift, located.bits,
+	                           format.type, format.is_signed});
+	return result;
 }
 
 // The value of an output component: its selector's constant, or its decoded memory component.
@@ -1468,6 +1482,44 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 }
 
 } // namespace
+
+// A module with runtime formats decodes every formatted component it loads with one function,
+// called, which the driver is asked not to inline (FunctionControl DontInline): a copy at every
+// component made the portable module of dd41a95a8390a044 (12K guest dwords) 1.98M SPIR-V words and
+// about 3 minutes to compile on NVIDIA; called and kept a call, 1.13M words and half the time. The
+// call costs only the first encounters, until the specialized module replaces the portable one.
+void DefineRuntimeDecode(EmitterState& state) {
+	const auto& program = state.program;
+	if (program.bindings.buffer_word_count == 0 && !program.table_mode) {
+		return;
+	}
+	if (std::ranges::none_of(program.info.buffers, [](const IR::BufferResource& buffer) {
+		    return IR::RuntimeBufferFormat(buffer) &&
+		           buffer.descriptor_format == Prospero::BufferFormat::kInvalid;
+	    })) {
+		return;
+	}
+	const auto u32 = TypeU32(state);
+	const auto function_t =
+	    state.builder.Type(OpTypeFunction, {u32, u32, u32, u32, u32, TypeBool(state)});
+	state.runtime_decode_function = state.builder.AllocateId();
+	const auto dword              = state.builder.AllocateId();
+	const auto shift              = state.builder.AllocateId();
+	const auto bits               = state.builder.AllocateId();
+	const auto type               = state.builder.AllocateId();
+	const auto sign               = state.builder.AllocateId();
+	state.builder.AddName(state.runtime_decode_function, "decode_runtime_component");
+	state.builder.AddFunction(
+	    {OpFunction, u32, state.runtime_decode_function, FunctionControlDontInline, function_t});
+	for (const auto parameter: {dword, shift, bits, type}) {
+		state.builder.AddFunction({OpFunctionParameter, u32, parameter});
+	}
+	state.builder.AddFunction({OpFunctionParameter, TypeBool(state), sign});
+	EmitLabel(state, state.builder.AllocateId());
+	const auto result = EmitRuntimeDecode(state, type, sign, shift, bits, dword);
+	state.builder.AddFunction({OpReturnValue, result});
+	state.builder.AddFunction({OpFunctionEnd});
+}
 
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
