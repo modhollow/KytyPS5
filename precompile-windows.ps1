@@ -44,9 +44,11 @@ param(
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
 	[switch]$Coverage,
 	[switch]$InputsOnly,
-	# Every allowed CPU at full power (the processes still below normal priority), instead of the cores less one at
-	# reduced power.
+	# Every allowed CPU (the processes still below normal priority), instead of the cores less one.
+	# Overrides EcoQoS.
 	[switch]$FullSpeed,
+	# Opt in to Windows EcoQoS power saving. Lower clocks/efficient cores can lengthen precompilation.
+	[switch]$EcoQoS,
 	# Print the processes, threads and power the run would use (JSON) and exit; -LogicalCpus/-PhysicalCores stand
 	# in for this PC's (tests).
 	[switch]$PlanOnly,
@@ -77,9 +79,10 @@ $cpus = 0
 for ($bit = 0; $bit -lt 64; $bit++) { if ($mask -band ([int64]1 -shl $bit)) { $cpus++ } }
 # The processes (Jobs), threads each and power of the shards, and the threads of the single-process steps (Budget).
 # A process scales to a few threads (4: 85%), and each translates the programs its share needs. By default the
-# allowed CPUs' share of the cores less one, at reduced power: an SMT sibling adds little compile throughput and the
-# most heat, and one core stays free for the rest of the PC. -FullSpeed: every allowed CPU at full power.
-function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$threads, [int]$jobs, [bool]$fullSpeed) {
+# allowed CPUs' share of the cores less one: an SMT sibling adds little compile throughput and the most heat,
+# and one core stays free for the rest of the PC. EcoQoS is opt-in because precompilation blocks game launch.
+# -FullSpeed: every allowed CPU, with EcoQoS disabled.
+function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$threads, [int]$jobs, [bool]$fullSpeed, [bool]$ecoQoS) {
 	if ($fullSpeed) {
 		if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Ceiling($cpus / $threads)) }
 		return [pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$cpus; Efficient = $false }
@@ -88,9 +91,9 @@ function Get-PrecompilePlan([int]$cpus, [int]$logical, [int]$physical, [int]$thr
 	$budget = [math]::Max(1, $cores - 1)
 	$threads = [math]::Min($threads, $budget)
 	if ($jobs -le 0) { $jobs = [math]::Max(1, [math]::Floor($budget / $threads)) }
-	[pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$budget; Efficient = $true }
+	[pscustomobject]@{ Jobs = [int]$jobs; Threads = [int]$threads; Budget = [int]$budget; Efficient = $ecoQoS }
 }
-$plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent
+$plan = Get-PrecompilePlan $cpus $LogicalCpus $PhysicalCores $Threads $Jobs $FullSpeed.IsPresent $EcoQoS.IsPresent
 if ($PlanOnly) {
 	[pscustomobject]@{ Cpus = $cpus; Jobs = $plan.Jobs; Threads = $plan.Threads; Budget = $plan.Budget; Efficient = $plan.Efficient } |
 		ConvertTo-Json -Compress
@@ -226,8 +229,8 @@ $logName = $logs.Substring($PSScriptRoot.Length + 1)
 New-Item -ItemType Directory -Force $logs | Out-Null
 $begin = Get-Date
 
-# Reduced power for a precompile process (Windows EcoQoS: every thread of it, the driver's too, at lower clocks).
-if (!('Kyty.ProcessPower' -as [type])) {
+# Opt-in Windows execution-speed throttling for a precompile process.
+if ($plan.Efficient -and !('Kyty.ProcessPower' -as [type])) {
 	Add-Type -Namespace Kyty -Name ProcessPower -MemberDefinition @'
 [StructLayout(LayoutKind.Sequential)]
 public struct PowerThrottlingState { public uint Version; public uint ControlMask; public uint StateMask; }
@@ -251,7 +254,7 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
 	if ($plan.Efficient -and ![Kyty.ProcessPower]::Throttle($process.Handle) -and $script:reducedPower -ne 'unavailable') {
 		$script:reducedPower = 'unavailable'
-		Write-Host 'precompile: this Windows has no reduced-power mode (EcoQoS); the processes run at full power'
+		Write-Host 'precompile: Windows did not enable EcoQoS; continuing with its default power policy'
 	}
 	$process.ProcessorAffinity = [IntPtr]$mask
 	$null = $process.Handle # keeps the exit code readable after the process ends
@@ -264,7 +267,7 @@ function Wait-Precompile($process, [string]$what) {
 	if ($process.ExitCode -ne 0) { throw "$what failed; logs: $logName" }
 }
 
-Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time of $Threads threads, affinity 0x$('{0:X}' -f $mask), $(if ($plan.Efficient) { 'reduced power (-FullSpeed: every CPU at full power)' } else { 'full power' }); logs $logName"
+Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time of $Threads threads, affinity 0x$('{0:X}' -f $mask), $(if ($plan.Efficient) { 'EcoQoS power saving (-FullSpeed disables it)' } else { 'EcoQoS off' }); logs $logName"
 try {
 if ($Coverage) {
 	$out = [IO.Path]::ChangeExtension($Seeds, '.compiled.shaders')
@@ -283,13 +286,13 @@ if ($InputsOnly) {
 }
 # The shards an interrupted run finished first: what they hold is not compiled again.
 Wait-Precompile (Start-Precompile 'merge-before' @('--merge')) 'merge'
-$pending = [System.Collections.Generic.Queue[object]]::new()
+$pending = [System.Collections.Generic.LinkedList[object]]::new()
 $count = if ($ShardLimit -gt 0) { [math]::Min($ShardLimit, $Shards) } else { $Shards }
-for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Seeds, "$i/$Shards")) }
+for ($i = 0; $i -lt $count; $i++) { [void]$pending.AddLast(@($Seeds, "$i/$Shards")) }
 if ($ShardLimit -le 0 -and $Recorded -and (Test-Path $Recorded)) {
 	# About as many pipelines a shard as the seeds' (100: a recording of every world holds about 16000).
 	$count = [math]::Max(1, [math]::Ceiling((Get-SeedPipelines $Recorded) / 100))
-	for ($i = 0; $i -lt $count; $i++) { $pending.Enqueue(@($Recorded, "$i/$count")) }
+	for ($i = 0; $i -lt $count; $i++) { [void]$pending.AddLast(@($Recorded, "$i/$count")) }
 }
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
@@ -300,7 +303,8 @@ $split = 0
 $shown = Get-Date
 while ($pending.Count -or $running.Count) {
 	while ($pending.Count -and $running.Count -lt $Jobs) {
-		$seedFile, $shard = $pending.Dequeue()
+		$seedFile, $shard = $pending.First.Value
+		$pending.RemoveFirst()
 		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
 		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard, '--threads', "$Threads")))
 	}
@@ -313,8 +317,11 @@ while ($pending.Count -or $running.Count) {
 		if ($process.ExitCode -eq 3) {
 			$i, $n = [int[]]($shard -split '/')
 			if ($n -ge 65536) { throw "$name cannot be split further; logs: $logName" }
-			$pending.Enqueue(@($seedFile, "$i/$(2 * $n)"))
-			$pending.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
+			# Resolve smaller retries before expanding all remaining parents. A FIFO
+			# frontier can grow for hours without reaching a completed or terminal child.
+			# Both modulo halves remain scheduled; partial shard data stays available.
+			[void]$pending.AddFirst(@($seedFile, "$($i + $n)/$(2 * $n)"))
+			[void]$pending.AddFirst(@($seedFile, "$i/$(2 * $n)"))
 			$split++
 		} elseif ($process.ExitCode -ne 0) {
 			throw "$name failed; logs: $logName"
